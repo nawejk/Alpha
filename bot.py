@@ -1,10 +1,10 @@
 # bot_single.py
-# Telegram Signals & Auto-Entry Bot (Single File)
+# Telegram Signals & Auto-Entry Bot (Single File, enhanced)
 # Features:
-# - Admin-Menü: Calls erstellen & an Abonnenten senden
-# - User-Menü: Solana-Einzahlung (Watch), Abo, Auto-Entry-Modus
-# - Auto-Executor (SIMULATED) für Meme-Spot & Futures
-# - SQLite DB, Inline-Buttons
+# - Admin-Menü: Calls erstellen & an Abonnenten mit Guthaben senden
+# - User-Menü: Solana-Einzahlung (Watch & Balance), Abo, Auto-Entry + Risiko (Low/Medium/High)
+# - Auto-Executor (SIMULATED) für Meme-Spot & Futures (nach außen "realistisch")
+# - SQLite DB, Inline-Buttons, Auszahlung-Workflow, Hilfe
 #
 # Setup:
 #   pip install pyTelegramBotAPI solana solders base58 requests python-dotenv pytz
@@ -12,7 +12,7 @@
 #     BOT_TOKEN=...
 #     ADMIN_IDS=123456,987654
 #     SOLANA_RPC=https://api.mainnet-beta.solana.com
-#     CENTRAL_SOL_PUBKEY=optional
+#     CENTRAL_SOL_PUBKEY=optional (für Auszahlungen/Reserve)
 #
 # Start: python bot_single.py
 
@@ -21,7 +21,7 @@ import time
 import threading
 import sqlite3
 from contextlib import contextmanager
-from typing import Optional
+from typing import Optional, Dict
 
 import base58
 import telebot
@@ -45,6 +45,8 @@ CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "3wyVwpcbWt96mphJjskFsR2qoy
 
 DB_PATH = "memebot.db"
 
+LAMPORTS_PER_SOL = 1_000_000_000
+
 # ------------------------ DB LAYER ------------------------
 
 SCHEMA = """
@@ -56,7 +58,9 @@ CREATE TABLE IF NOT EXISTS users (
   is_admin INTEGER DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   sub_active INTEGER DEFAULT 0,
-  auto_mode TEXT DEFAULT 'OFF'          -- OFF | SIMULATED | LIVE
+  auto_mode TEXT DEFAULT 'OFF',           -- OFF | SIMULATED | LIVE
+  auto_risk TEXT DEFAULT 'MEDIUM',        -- LOW | MEDIUM | HIGH
+  sol_balance_lamports INTEGER DEFAULT 0  -- akkumuliertes Guthaben
 );
 
 CREATE TABLE IF NOT EXISTS deposits (
@@ -95,6 +99,15 @@ CREATE TABLE IF NOT EXISTS executions (
   FOREIGN KEY(call_id) REFERENCES calls(id),
   FOREIGN KEY(user_id) REFERENCES users(user_id)
 );
+
+CREATE TABLE IF NOT EXISTS payouts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  amount_lamports INTEGER NOT NULL,
+  status TEXT DEFAULT 'REQUESTED',      -- REQUESTED | APPROVED | SENT | REJECTED
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(user_id)
+);
 """
 
 @contextmanager
@@ -110,6 +123,11 @@ def get_db():
 def init_db():
     with get_db() as con:
         con.executescript(SCHEMA)
+        # defensive migrations (falls alte DB ohne Spalten)
+        try: con.execute("ALTER TABLE users ADD COLUMN auto_risk TEXT DEFAULT 'MEDIUM'")
+        except Exception: pass
+        try: con.execute("ALTER TABLE users ADD COLUMN sol_balance_lamports INTEGER DEFAULT 0")
+        except Exception: pass
 
 # ------------------------ HELPERS / MODELS ------------------------
 
@@ -137,9 +155,28 @@ def set_auto_mode(user_id:int, mode:str):
     with get_db() as con:
         con.execute("UPDATE users SET auto_mode=? WHERE user_id=?", (mode, user_id))
 
-def all_subscribers():
+def set_auto_risk(user_id:int, risk:str):
     with get_db() as con:
-        cur = con.execute("SELECT user_id FROM users WHERE sub_active=1")
+        con.execute("UPDATE users SET auto_risk=? WHERE user_id=?", (risk, user_id))
+
+def add_balance(user_id:int, lamports:int):
+    with get_db() as con:
+        con.execute("UPDATE users SET sol_balance_lamports = sol_balance_lamports + ? WHERE user_id=?", (lamports, user_id))
+
+def subtract_balance(user_id:int, lamports:int)->bool:
+    with get_db() as con:
+        bal = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()["sol_balance_lamports"]
+        if bal < lamports: return False
+        con.execute("UPDATE users SET sol_balance_lamports = sol_balance_lamports - ? WHERE user_id=?", (lamports, user_id))
+        return True
+
+def get_balance_lamports(user_id:int)->int:
+    with get_db() as con:
+        return con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()["sol_balance_lamports"]
+
+def all_subscribers_with_balance():
+    with get_db() as con:
+        cur = con.execute("SELECT user_id FROM users WHERE sol_balance_lamports > 0")
         return [r["user_id"] for r in cur.fetchall()]
 
 def create_call(created_by:int, market_type:str, symbol:str, side:str, entry:str, stop:str, targets:str, leverage:str, notes:str)->int:
@@ -163,6 +200,9 @@ def queue_execution(call_id:int, user_id:int, mode:str, status:str="QUEUED", mes
         """, (call_id, user_id, mode, status, message))
         return cur.lastrowid
 
+def fmt_sol(lamports:int)->str:
+    return f"{lamports / LAMPORTS_PER_SOL:.6f} SOL"
+
 def fmt_call(c)->str:
     lines = [f"🧩 *{c['market_type']}* | *{c['symbol']}* | *{c['side']}*"]
     if c["leverage"]: lines.append(f"Leverage: `{c['leverage']}`")
@@ -174,30 +214,37 @@ def fmt_call(c)->str:
 
 # ------------------------ KEYBOARDS ------------------------
 
-def kb_main(is_admin_flag=False):
+def kb_main(is_admin_flag=False, balance_lamports: int = 0):
+    bal = fmt_sol(balance_lamports)
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("💸 Einzahlen (Solana)", callback_data="deposit"))
-    kb.add(InlineKeyboardButton("🔔 Signale abonnieren", callback_data="sub_on"),
-           InlineKeyboardButton("🔕 Abo beenden", callback_data="sub_off"))
-    kb.add(InlineKeyboardButton("⚙️ Auto-Entry Modus", callback_data="auto_menu"))
+    kb.add(InlineKeyboardButton("💸 Einzahlen (Solana)", callback_data="deposit"),
+           InlineKeyboardButton("💳 Auszahlung", callback_data="withdraw"))
+    kb.add(InlineKeyboardButton("⚙️ Auto-Entry", callback_data="auto_menu"))
+    kb.add(InlineKeyboardButton("ℹ️ Hilfe", callback_data="help"))
     if is_admin_flag:
-        kb.add(InlineKeyboardButton("🛠 Admin-Menü", callback_data="admin_menu"))
+        kb.add(InlineKeyboardButton("🛠 Admin-Menü", callback_data="admin_menu"))
+    # Balance-Zeile (nur Info)
+    kb.add(InlineKeyboardButton(f"Guthaben: {bal}", callback_data="noop"))
     return kb
 
-def kb_auto(current:str):
+def kb_auto(current_mode:str, risk:str):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("OFF", callback_data="auto_OFF"),
            InlineKeyboardButton("SIMULATED", callback_data="auto_SIMULATED"),
            InlineKeyboardButton("LIVE", callback_data="auto_LIVE"))
-    kb.add(InlineKeyboardButton(f"Aktueller Modus: {current}", callback_data="noop"))
-    kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
+    kb.add(InlineKeyboardButton("Risk: LOW", callback_data="risk_LOW"),
+           InlineKeyboardButton("MEDIUM", callback_data="risk_MEDIUM"),
+           InlineKeyboardButton("HIGH", callback_data="risk_HIGH"))
+    kb.add(InlineKeyboardButton(f"Aktueller Modus: {current_mode}", callback_data="noop"))
+    kb.add(InlineKeyboardButton(f"Aktuelles Risiko: {risk}", callback_data="noop"))
+    kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
     return kb
 
 def kb_admin():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("➕ Call erstellen", callback_data="admin_new_call"))
-    kb.add(InlineKeyboardButton("📤 Call senden", callback_data="admin_broadcast_last"))
-    kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
+    kb.add(InlineKeyboardButton("📤 Call senden (an User mit Guthaben)", callback_data="admin_broadcast_last"))
+    kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
     return kb
 
 # ------------------------ SOLANA WATCHER ------------------------
@@ -256,45 +303,57 @@ class SolWatcher:
 
 # ------------------------ CONNECTOR STUBS (SIMULATED) ------------------------
 
-def dex_market_buy_simulated(user_id:int, mint_or_symbol:str, amount_usd:float):
-    return {"status":"FILLED", "txid":"SIM-TX-"+mint_or_symbol, "price":"~", "amount_usd":amount_usd}
+def dex_market_buy_simulated(user_id:int, mint_or_symbol:str, amount_lamports:int):
+    # amount_lamports ist das "Einsatz"-Äquivalent
+    return {"status":"FILLED", "txid":"SIM-TX-"+mint_or_symbol, "spent_lamports": amount_lamports}
 
-def cex_futures_place_simulated(user_id:int, symbol:str, side:str, leverage:str, entry:str, stop:str, targets:str):
-    return {"status":"FILLED", "order_id":"SIM-ORDER", "symbol":symbol, "side":side, "lev":leverage}
+def cex_futures_place_simulated(user_id:int, symbol:str, side:str, leverage:str, risk:str):
+    return {"status":"FILLED", "order_id":"SIM-ORDER", "symbol":symbol, "side":side, "lev":leverage, "risk":risk}
 
 # ------------------------ BOT ------------------------
 
 init_db()
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
+# simple conversation states
+WAITING_WITHDRAW_AMOUNT: Dict[int, bool] = {}
+
 watcher = SolWatcher(SOLANA_RPC)
 
 def _on_deposit(evt:dict):
     uid = evt["user_id"]
     lam = evt["amount_lamports"]
-    sol = lam / 1_000_000_000
+    add_balance(uid, lam)
+    new_bal = get_balance_lamports(uid)
     try:
-        bot.send_message(uid, f"✅ *Einzahlung eingegangen:* {sol:.6f} SOL", parse_mode="Markdown")
+        bot.send_message(
+            uid,
+            f"✅ *Einzahlung eingegangen:* {fmt_sol(lam)}\n"
+            f"Neues Guthaben: *{fmt_sol(new_bal)}*",
+            parse_mode="Markdown")
     except Exception as e:
         print("notify deposit error:", e)
 
 watcher.on_deposit = _on_deposit
-watcher.start(interval_sec=45)
+watcher.start(interval_sec=30)
 
-@bot.message_handler(commands=["start"])
+def home_text(uid:int)->str:
+    u = get_user(uid)
+    bal = fmt_sol(u["sol_balance_lamports"])
+    return (
+        "Willkommen! 🎯\n"
+        "Professioneller Signals & Auto-Entry Bot für Meme-Coins (Spot) und Futures.\n\n"
+        f"Dein aktuelles Guthaben: *{bal}*"
+    )
+
+@bot.message_handler(commands=["start","balance"])
 def cmd_start(m:Message):
     uid = m.from_user.id
     uname = m.from_user.username or ""
     admin_flag = 1 if is_admin(uid) else 0
     upsert_user(uid, uname, admin_flag)
     u = get_user(uid)
-    welcome = (
-        "Willkommen! 🎯\n"
-        "Professioneller Signals & Auto-Entry Bot für Meme-Coins (Spot) und Futures.\n\n"
-        "⚠️ *Hinweis:* Auto-Entry ist standardmäßig *SIMULIERT*. "
-        "LIVE erfordert Wallet-/API-Konfiguration. "
-    )
-    bot.reply_to(m, welcome, reply_markup=kb_main(is_admin_flag=bool(u["is_admin"])))
+    bot.reply_to(m, home_text(uid), reply_markup=kb_main(is_admin_flag=bool(u["is_admin"]), balance_lamports=u["sol_balance_lamports"]))
 
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(c:CallbackQuery):
@@ -303,40 +362,66 @@ def on_cb(c:CallbackQuery):
     data = c.data
 
     if data == "back_home":
-        bot.edit_message_text("Hauptmenü", c.message.chat.id, c.message.message_id,
-                              reply_markup=kb_main(is_admin_flag=bool(u["is_admin"])))
+        u = get_user(uid)
+        bot.edit_message_text(home_text(uid), c.message.chat.id, c.message.message_id,
+                              reply_markup=kb_main(is_admin_flag=bool(u["is_admin"]), balance_lamports=u["sol_balance_lamports"]))
+        return
+
+    if data == "help":
+        text = (
+            "ℹ️ *Hilfe*\n\n"
+            "1) Klicke *Einzahlen*, kopiere deine persönliche SOL-Adresse und sende SOL dorthin.\n"
+            "2) Nach Bestätigung wird dein *Guthaben gutgeschrieben*.\n"
+            "3) Nur User mit Guthaben erhalten *Signale*.\n"
+            "4) *Auto-Entry*: OFF/SIMULATED/LIVE + Risiko (LOW/MEDIUM/HIGH).\n"
+            "5) *Auszahlung*: Betrag eingeben → Admin prüft und sendet manuell.\n"
+            f"{'Zentrale Wallet: `'+CENTRAL_SOL_PUBKEY+'`' if CENTRAL_SOL_PUBKEY else ''}"
+        )
+        bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode="Markdown",
+                              reply_markup=kb_main(is_admin_flag=bool(u["is_admin"]), balance_lamports=u["sol_balance_lamports"]))
         return
 
     if data == "deposit":
         addr = watcher.ensure_user_address(uid)
+        bot.answer_callback_query(c.id, "Adresse erstellt/abgerufen.")
         text = (
-            "💸 *Einzahlung (Solana)*\n"
-            f"Sende SOL an deine *persönliche* Adresse:\n`{addr}`\n\n"
-            "_Nach Bestätigung erhältst du automatisch eine Nachricht._"
+            "💸 *Einzahlung (Solana)*\n\n"
+            "Sende SOL an deine *persönliche* Adresse:\n"
+            f"`{addr}`\n\n"
+            "_Nach Bestätigung wird dein Guthaben automatisch gutgeschrieben._"
         )
         if CENTRAL_SOL_PUBKEY:
-            text += f"\n\n(Zentrale Wallet: `{CENTRAL_SOL_PUBKEY}` – nur für Auszahlungen/Reserve)"
-        bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode="Markdown",
-                              reply_markup=kb_main(is_admin_flag=bool(u["is_admin"])))
+            text += f"\n\n(Zentrale Wallet: `{CENTRAL_SOL_PUBKEY}` – für Auszahlungen/Reserve)"
+        bot.send_message(c.message.chat.id, text, parse_mode="Markdown")
+        # zeige wieder Hauptmenü mit Balance
+        u = get_user(uid)
+        bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id,
+            reply_markup=kb_main(is_admin_flag=bool(u["is_admin"]), balance_lamports=u["sol_balance_lamports"]))
+        return
+
+    if data == "withdraw":
+        WAITING_WITHDRAW_AMOUNT[uid] = True
+        bot.answer_callback_query(c.id, "Bitte Betrag eingeben.")
+        bot.send_message(c.message.chat.id, "💳 *Auszahlung*\nGib den Betrag in SOL ein (z. B. `0.25`).", parse_mode="Markdown")
         return
 
     if data == "sub_on":
         set_subscription(uid, True)
         bot.answer_callback_query(c.id, "Abo aktiviert")
         bot.edit_message_text("🔔 Abo ist *aktiv*.", c.message.chat.id, c.message.message_id,
-                              parse_mode="Markdown", reply_markup=kb_main(is_admin_flag=bool(u["is_admin"])))
+                              parse_mode="Markdown", reply_markup=kb_main(is_admin_flag=bool(u["is_admin"]), balance_lamports=u["sol_balance_lamports"]))
         return
 
     if data == "sub_off":
         set_subscription(uid, False)
         bot.answer_callback_query(c.id, "Abo beendet")
         bot.edit_message_text("🔕 Abo *beendet*.", c.message.chat.id, c.message.message_id,
-                              parse_mode="Markdown", reply_markup=kb_main(is_admin_flag=bool(u["is_admin"])))
+                              parse_mode="Markdown", reply_markup=kb_main(is_admin_flag=bool(u["is_admin"]), balance_lamports=u["sol_balance_lamports"]))
         return
 
     if data == "auto_menu":
         bot.edit_message_text("Auto-Entry Einstellungen:", c.message.chat.id, c.message.message_id,
-                              reply_markup=kb_auto(u["auto_mode"]))
+                              reply_markup=kb_auto(u["auto_mode"], u["auto_risk"]))
         return
 
     if data.startswith("auto_"):
@@ -345,7 +430,16 @@ def on_cb(c:CallbackQuery):
         bot.answer_callback_query(c.id, f"Auto-Entry: {mode}")
         nu = get_user(uid)
         bot.edit_message_text(f"Auto-Entry: *{mode}*", c.message.chat.id, c.message.message_id,
-                              parse_mode="Markdown", reply_markup=kb_auto(nu["auto_mode"]))
+                              parse_mode="Markdown", reply_markup=kb_auto(nu["auto_mode"], nu["auto_risk"]))
+        return
+
+    if data.startswith("risk_"):
+        risk = data.split("_",1)[1]
+        set_auto_risk(uid, risk)
+        bot.answer_callback_query(c.id, f"Risk: {risk}")
+        nu = get_user(uid)
+        bot.edit_message_text("Auto-Entry Einstellungen aktualisiert.", c.message.chat.id, c.message.message_id,
+                              reply_markup=kb_auto(nu["auto_mode"], nu["auto_risk"]))
         return
 
     # Admin
@@ -353,7 +447,7 @@ def on_cb(c:CallbackQuery):
         if not is_admin(uid):
             bot.answer_callback_query(c.id, "Nicht erlaubt.")
             return
-        bot.edit_message_text("🛠 Admin-Menü", c.message.chat.id, c.message.message_id,
+        bot.edit_message_text("🛠 Admin-Menü", c.message.chat.id, c.message.message_id,
                               reply_markup=kb_admin())
         return
 
@@ -377,7 +471,7 @@ def on_cb(c:CallbackQuery):
             bot.answer_callback_query(c.id, "Kein Call vorhanden.")
             return
         msg = "📣 *Neuer Call:*\n" + fmt_call(row)
-        subs = all_subscribers()
+        subs = all_subscribers_with_balance()
         sent = 0
         for su in subs:
             try:
@@ -386,7 +480,7 @@ def on_cb(c:CallbackQuery):
                 sent += 1
             except Exception as e:
                 print("broadcast error", su, e)
-        bot.answer_callback_query(c.id, f"An {sent} Abonnenten gesendet.")
+        bot.answer_callback_query(c.id, f"An {sent} User mit Guthaben gesendet.")
         return
 
 def handle_admin_call_input(m:Message):
@@ -404,14 +498,47 @@ def handle_admin_call_input(m:Message):
     c = get_call(cid)
     bot.send_message(uid, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode="Markdown", reply_markup=kb_admin())
 
+# ------------------------ TEXT HANDLER (AUSZAHLUNG) ------------------------
+
+@bot.message_handler(func=lambda m: WAITING_WITHDRAW_AMOUNT.get(m.from_user.id, False))
+def handle_withdraw_amount(m:Message):
+    uid = m.from_user.id
+    WAITING_WITHDRAW_AMOUNT[uid] = False
+    try:
+        txt = (m.text or "").replace(",", ".").strip()
+        sol = float(txt)
+        if sol <= 0:
+            bot.reply_to(m, "Betrag muss > 0 sein.")
+            return
+        lam = int(sol * LAMPORTS_PER_SOL)
+        if not subtract_balance(uid, lam):
+            bot.reply_to(m, f"Unzureichendes Guthaben. Verfügbar: {fmt_sol(get_balance_lamports(uid))}")
+            return
+        with get_db() as con:
+            con.execute("INSERT INTO payouts(user_id, amount_lamports) VALUES (?,?)", (uid, lam))
+        bot.reply_to(m, f"✅ Auszahlungsanfrage erstellt: *{sol:.6f} SOL*.\n"
+                        "Ein Admin prüft und sendet zeitnah.", parse_mode="Markdown")
+        # Admin informieren
+        for aid in ADMIN_IDS:
+            try:
+                bot.send_message(int(aid), f"💳 Auszahlung angefragt von {uid}: {sol:.6f} SOL", parse_mode="Markdown")
+            except Exception as e:
+                print("notify admin payout error:", e)
+    except Exception:
+        bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. `0.25`.", parse_mode="Markdown")
+
 # ------------------------ AUTO EXECUTOR LOOP (SIMULATED) ------------------------
+
+def risk_to_fraction(risk:str)->float:
+    # Anteil des Guthabens pro Trade
+    return {"LOW":0.05, "MEDIUM":0.10, "HIGH":0.20}.get(risk.upper(), 0.10)
 
 def auto_executor_loop():
     while True:
         try:
             with get_db() as con:
                 rows = con.execute("""
-                    SELECT e.id as eid, e.user_id, e.call_id, e.mode, e.status, u.auto_mode
+                    SELECT e.id as eid, e.user_id, e.call_id, e.mode, e.status, u.auto_mode, u.auto_risk, u.sol_balance_lamports
                     FROM executions e
                     JOIN users u ON u.user_id = e.user_id
                     WHERE e.status='QUEUED'
@@ -420,22 +547,62 @@ def auto_executor_loop():
             for r in rows:
                 if r["auto_mode"] == "OFF":
                     with get_db() as con:
-                        con.execute("UPDATE executions SET status='ERROR', message='User auto OFF' WHERE id=?", (r["eid"],))
+                        con.execute("UPDATE executions SET status='ERROR', message='Auto OFF' WHERE id=?", (r["eid"],))
                     continue
                 call = get_call(r["call_id"])
+                # Einsatz je nach Risiko
+                frac = risk_to_fraction(r["auto_risk"] or "MEDIUM")
+                stake_lamports = max(int(r["sol_balance_lamports"] * frac), int(0.01 * LAMPORTS_PER_SOL))  # min 0.01 SOL
+                if stake_lamports <= 0 or r["sol_balance_lamports"] < stake_lamports:
+                    with get_db() as con:
+                        con.execute("UPDATE executions SET status='ERROR', message='Zu wenig Guthaben' WHERE id=?", (r["eid"],))
+                    continue
+
+                # "realistischer" Abzug des Einsatzes
+                ok = subtract_balance(r["user_id"], stake_lamports)
+                if not ok:
+                    with get_db() as con:
+                        con.execute("UPDATE executions SET status='ERROR', message='Balance-Abzug fehlgeschlagen' WHERE id=?", (r["eid"],))
+                    continue
+
                 result = {"status":"ERROR"}
                 if call["market_type"].upper() == "MEME_SPOT":
-                    result = dex_market_buy_simulated(r["user_id"], call["symbol"], amount_usd=50.0)
+                    result = dex_market_buy_simulated(r["user_id"], call["symbol"], stake_lamports)
                 elif call["market_type"].upper() == "FUTURES":
-                    result = cex_futures_place_simulated(r["user_id"], call["symbol"], call["side"], call["leverage"], call["entry"], call["stop"], call["targets"])
+                    result = cex_futures_place_simulated(r["user_id"], call["symbol"], call["side"], call["leverage"], r["auto_risk"])
+
                 status = result.get("status","ERROR")
                 txid = result.get("txid") or result.get("order_id") or ""
+
                 with get_db() as con:
                     con.execute("UPDATE executions SET status=?, txid=?, message=? WHERE id=?",
                                 (status, txid, str(result), r["eid"]))
+
+                # einfache "P&L" Simulation: Medium ~0%, Low leicht positiv, High volatiler
+                pnl_frac = 0.0
+                risk = (r["auto_risk"] or "MEDIUM").upper()
+                if risk == "LOW":
+                    pnl_frac = 0.01
+                elif risk == "MEDIUM":
+                    pnl_frac = 0.0
+                else:  # HIGH
+                    pnl_frac = 0.02  # kann man später zufällig gestalten
+
+                pnl = int(stake_lamports * pnl_frac)
+                if pnl != 0:
+                    add_balance(r["user_id"], pnl)
+
                 try:
-                    bot.send_message(r["user_id"], f"🤖 Auto-Entry ({call['market_type']}): *{status}*\n{fmt_call(call)}\n`{txid}`",
-                                     parse_mode="Markdown")
+                    bal_after = get_balance_lamports(r["user_id"])
+                    bot.send_message(
+                        r["user_id"],
+                        f"🤖 Auto-Entry ({call['market_type']}) • {risk}\n"
+                        f"Status: *{status}*\n{fmt_call(call)}\n"
+                        f"Einsatz: {fmt_sol(stake_lamports)}\n"
+                        f"P&L: {fmt_sol(pnl)}\n"
+                        f"Guthaben: *{fmt_sol(bal_after)}*\n"
+                        f"`{txid}`",
+                        parse_mode="Markdown")
                 except Exception as e:
                     print("notify exec error", e)
         except Exception as e:
@@ -446,5 +613,5 @@ threading.Thread(target=auto_executor_loop, daemon=True).start()
 
 # ------------------------ RUN ------------------------
 
-print("Bot läuft...")
+print("Bot läuft...")
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
