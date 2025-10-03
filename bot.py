@@ -1,15 +1,23 @@
 # bot_single.py
-# Signals & Auto-Entry Bot — Central-Deposit + Live USDC
-# (deposit recognition improved: parsed instructions + fallback to balance deltas)
+# Signals & Auto-Entry Bot — Central-Deposit + Live USDC (RAW RPC)
+#
+# Änderungen (genau nach Wunsch):
+# - Einzahlung nutzt NUR die zentrale Adresse (CENTRAL_SOL_PUBKEY).
+# - User MUSS zuerst seine Absender-Wallet angeben.
+# - Watcher scannt die zentrale Adresse via RPC (getSignaturesForAddress/getTransaction, jsonParsed)
+#   und schreibt Guthaben gut, wenn Quelle == Absender-Wallet.
+# - Neben SOL-Beträgen wird der Live-Preis in USDC angezeigt.
+# - KEINE Imports von solana/solders/PublicKey/etc.
+# - Zentrale Adresse wird als <code>...</code> bzw. Markdown-Backticks angezeigt (leicht kopierbar).
 #
 # Setup:
-#   pip install pyTelegramBotAPI solana solders base58 requests python-dotenv pytz
+#   pip install pyTelegramBotAPI requests python-dotenv pytz
 #
-# ENV examples:
-#   BOT_TOKEN=...
-#   ADMIN_IDS=8076025426
-#   SOLANA_RPC=https://api.mainnet-beta.solana.com
-#   CENTRAL_SOL_PUBKEY=3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy
+# ENV / Defaults:
+#   BOT_TOKEN = 8212740282:AAEfOzr7e8EMyNi_8wjm7bndwk-cxZBvTRw
+#   ADMIN_IDS = 8076025426
+#   SOLANA_RPC = https://api.mainnet-beta.solana.com
+#   CENTRAL_SOL_PUBKEY = 3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy
 #
 # Start: python bot_single.py
 
@@ -18,14 +26,11 @@ import time
 import threading
 import sqlite3
 from contextlib import contextmanager
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 
 import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
-
-from solders.pubkey import Pubkey
-from solana.rpc.api import Client as SolClient
 
 # ------------------------ CONFIG ------------------------
 
@@ -36,65 +41,26 @@ if not BOT_TOKEN:
 ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") if a.strip()]
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
 CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy").strip()
-if not CENTRAL_SOL_PUBKEY:
-    raise RuntimeError("CENTRAL_SOL_PUBKEY env missing")
 
 DB_PATH = "memebot.db"
 LAMPORTS_PER_SOL = 1_000_000_000
-MIN_SUB_SOL = 0.2  # min balance to subscribe
-
-# ------------------------ SOLDERS-COMPAT HELPERS ------------------------
-
-def as_json(resp: Any) -> dict:
-    """Return a JSON-like dict from solana/solders response."""
-    if isinstance(resp, dict):
-        return resp
-    # Try to_json()
-    try:
-        return resp.to_json()
-    except Exception:
-        pass
-    # Fallback: check common attributes
-    try:
-        v = getattr(resp, "value", None)
-        return {"result": v}
-    except Exception:
-        return {}
-
-def get_result(j: dict):
-    return j.get("result") if isinstance(j, dict) else None
-
-def get_value(j: dict):
-    if isinstance(j, dict):
-        return j.get("value") or j.get("result")
-    return None
-
-def get_signature(entry: Any) -> Optional[str]:
-    if isinstance(entry, dict):
-        return entry.get("signature")
-    try:
-        return str(entry.signature)
-    except Exception:
-        return None
-
-def key_to_str(k: Any) -> Optional[str]:
-    if isinstance(k, dict):
-        return k.get("pubkey")
-    return str(k) if k is not None else None
+MIN_SUB_SOL = 0.2
 
 # ------------------------ SIMPLE PRICE (SOL->USDC) ------------------------
 
 _price_cache = {"t": 0, "usd": 0.0}
 
 def get_sol_usd() -> float:
+    # Cached 60s to avoid rate limits
     now = time.time()
     if now - _price_cache["t"] < 60 and _price_cache["usd"] > 0:
         return _price_cache["usd"]
     try:
+        # CoinGecko simple endpoint; USDC ~ USD
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
             params={"ids": "solana", "vs_currencies": "usd"},
-            timeout=5
+            timeout=6
         )
         usd = float(r.json().get("solana", {}).get("usd", 0.0) or 0.0)
         if usd > 0:
@@ -102,10 +68,12 @@ def get_sol_usd() -> float:
             return usd
     except Exception:
         pass
+    # Fallback (nur Anzeige)
     return _price_cache["usd"] or 0.0
 
-def fmt_sol_usdc(lamports: int) -> str:
-    sol = lamports / LAMPORTS_PER_SOL if isinstance(lamports, (int, float)) else 0.0
+def fmt_sol_usdc(lamports_or_int: int) -> str:
+    lam = int(lamports_or_int)
+    sol = lam / LAMPORTS_PER_SOL
     usd = get_sol_usd()
     if usd > 0:
         return f"{sol:.6f} SOL (~{sol*usd:.2f} USDC)"
@@ -125,7 +93,7 @@ CREATE TABLE IF NOT EXISTS users (
   auto_mode TEXT DEFAULT 'OFF',           -- OFF | ON
   auto_risk TEXT DEFAULT 'MEDIUM',        -- LOW | MEDIUM | HIGH
   sol_balance_lamports INTEGER DEFAULT 0,
-  source_wallet TEXT                      -- user's sending wallet
+  source_wallet TEXT                      -- vom Nutzer angegebene Absender-Wallet
 );
 
 CREATE TABLE IF NOT EXISTS seen_txs (
@@ -139,7 +107,7 @@ CREATE TABLE IF NOT EXISTS calls (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   created_by INTEGER NOT NULL,
   market_type TEXT NOT NULL,            -- MEME | FUTURES
-  base TEXT NOT NULL,                   -- SOL / token name
+  base TEXT NOT NULL,                   -- SOL / Tokenname
   side TEXT,
   leverage TEXT,
   token_address TEXT,
@@ -185,6 +153,7 @@ def get_db():
 def init_db():
     with get_db() as con:
         con.executescript(SCHEMA)
+        # defensive migrations
         for stmt in [
             "ALTER TABLE users ADD COLUMN auto_mode TEXT DEFAULT 'OFF'",
             "ALTER TABLE users ADD COLUMN auto_risk TEXT DEFAULT 'MEDIUM'",
@@ -235,14 +204,16 @@ def add_balance(user_id:int, lamports:int):
 
 def subtract_balance(user_id:int, lamports:int)->bool:
     with get_db() as con:
-        bal = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()["sol_balance_lamports"]
+        bal_row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
+        bal = bal_row["sol_balance_lamports"] if bal_row else 0
         if bal < lamports: return False
         con.execute("UPDATE users SET sol_balance_lamports = sol_balance_lamports - ? WHERE user_id=?", (lamports, user_id))
         return True
 
 def get_balance_lamports(user_id:int)->int:
     with get_db() as con:
-        return con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()["sol_balance_lamports"]
+        row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return row["sol_balance_lamports"] if row else 0
 
 def list_investors(limit:int=50, offset:int=0):
     with get_db() as con:
@@ -334,23 +305,109 @@ def kb_payout_manage(pid:int):
            InlineKeyboardButton("❌ Ablehnen", callback_data=f"payout_REJECT_{pid}"))
     return kb
 
-def kb_deposit_copy():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("📋 Adresse kopieren", callback_data="copy_central_addr"))
-    kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
-    return kb
+# ------------------------ RAW SOLANA RPC HELPERS ------------------------
 
-# ------------------------ WATCHER (central deposit address) ------------------------
+checked_signatures = set()
+
+def rpc(method: str, params: list):
+    try:
+        r = requests.post(
+            SOLANA_RPC,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=10
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("RPC error:", e)
+        return {"result": None}
+
+def get_new_signatures_for_address(address: str, limit: int = 50) -> List[str]:
+    try:
+        res = rpc("getSignaturesForAddress", [address, {"limit": limit}])
+        arr = res.get("result") or []
+        sigs = []
+        for item in arr:
+            sig = item.get("signature")
+            if sig and sig not in checked_signatures:
+                sigs.append(sig)
+        sigs.reverse()  # oldest first
+        return sigs
+    except Exception as e:
+        print("getSignaturesForAddress error:", e)
+        return []
+
+def get_tx_details(sig: str, central_addr: str):
+    """
+    Liefert {'from': sender, 'amount_lamports': int, 'blockTime': int}
+    falls central_addr Lamports erhalten hat; sonst None.
+    """
+    try:
+        r = rpc("getTransaction", [sig, {"encoding":"jsonParsed","commitment":"confirmed"}])
+        res = r.get('result')
+        if not res:
+            return None
+        if (res.get('meta') or {}).get('err'):
+            return None
+
+        txmsg = (res.get('transaction') or {}).get('message', {})
+        meta = res.get('meta') or {}
+        keys_raw = txmsg.get('accountKeys') or []
+        keys = [k.get('pubkey') if isinstance(k, dict) else k for k in keys_raw]
+
+        pre = meta.get('preBalances')
+        post = meta.get('postBalances')
+        if pre is None or post is None:
+            return None
+
+        # Index der zentralen Adresse
+        try:
+            central_idx = keys.index(central_addr)
+        except ValueError:
+            return None
+
+        # Delta auf zentraler Adresse
+        if central_idx < len(pre) and central_idx < len(post):
+            delta_central = post[central_idx] - pre[central_idx]
+        else:
+            delta_central = 0
+
+        if delta_central <= 0:
+            return None
+
+        # Sender bestimmen (Heuristik 1: Balance drop)
+        sender = None
+        for i, (p, po) in enumerate(zip(pre, post)):
+            if p - po >= delta_central - 1000:
+                sender = keys[i]
+                break
+
+        # Falls nicht gefunden: aus parsed Instructions lesen
+        if not sender:
+            for inst in (txmsg.get('instructions') or []):
+                if isinstance(inst, dict):
+                    parsed = inst.get('parsed') or {}
+                    info = parsed.get('info') or {}
+                    if info.get('destination') == central_addr and info.get('source'):
+                        sender = info['source']; break
+                    if info.get('to') == central_addr and info.get('from'):
+                        sender = info['from']; break
+
+        return {"from": sender, "amount_lamports": int(delta_central), "blockTime": res.get("blockTime") or 0}
+    except Exception as e:
+        print("get_tx_details error:", e)
+        return None
+
+# ------------------------ WATCHER (zentraler Pubkey via RAW RPC) ------------------------
 
 class CentralWatcher:
-    def __init__(self, rpc_url:str, central_addr:str):
-        self.client = SolClient(rpc_url)
+    def __init__(self, central_addr:str):
         self.central = central_addr
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self.on_verified_deposit = None  # callback(evt)
 
-    def start(self, interval_sec:int=30):
+    def start(self, interval_sec:int=25):
         if self._running: return
         self._running = True
         self._thread = threading.Thread(target=self._loop, args=(interval_sec,), daemon=True)
@@ -375,120 +432,39 @@ class CentralWatcher:
                         (sig, user_id, lamports))
 
     def scan_central_recent(self):
-        try:
-            resp = self.client.get_signatures_for_address(Pubkey.from_string(self.central), limit=40)
-            rjson = as_json(resp)
-            sigs = get_value(rjson) or []
-        except Exception as e:
-            print("get_signatures_for_address error:", e)
-            return
-
+        sigs = get_new_signatures_for_address(self.central, limit=50)
         if not sigs:
             return
 
+        # Karte: Quelle -> user_id
         with get_db() as con:
             rows = con.execute("SELECT user_id, source_wallet FROM users WHERE source_wallet IS NOT NULL").fetchall()
         src_map = {r["source_wallet"]: r["user_id"] for r in rows if r["source_wallet"]}
 
-        for s in sigs:
-            sig = get_signature(s)
-            if not sig or self._is_seen(sig):
+        for sig in sigs:
+            if self._is_seen(sig):
+                checked_signatures.add(sig)
                 continue
-            try:
-                tx_resp = self.client.get_transaction(sig, encoding="jsonParsed")
-                tjson = as_json(tx_resp)
-                trx = get_result(tjson) or get_value(tjson) or {}
-                if not trx:
-                    continue
 
-                # 1) Prefer parsed instruction-based detection (system transfer)
-                credited = self._try_credit_via_parsed_instructions(trx, src_map, sig)
-                if credited:
-                    continue
+            details = get_tx_details(sig, self.central)
+            checked_signatures.add(sig)
+            if not details:
+                continue
 
-                # 2) Fallback: balance delta method
-                credited = self._try_credit_via_balance_delta(trx, src_map, sig)
-                if credited:
-                    continue
+            sender = details.get("from")
+            amount = int(details.get("amount_lamports") or 0)
+            if not sender or amount <= 0:
+                continue
 
-            except Exception as e:
-                print("scan tx error:", e)
+            uid = src_map.get(sender)
+            if not uid:
+                # keine zugeordnete Quelle
+                continue
 
-    def _try_credit_via_parsed_instructions(self, trx: dict, src_map: Dict[str,int], sig:str) -> bool:
-        """Scan message.instructions + meta.innerInstructions for system 'transfer' parsed entries."""
-        try:
-            msg = (trx.get("transaction") or {}).get("message", {})
-
-            def scan_instr_list(instr_list: List[dict]) -> Optional[bool]:
-                for ins in instr_list or []:
-                    parsed = ins.get("parsed") if isinstance(ins, dict) else None
-                    if not parsed:
-                        continue
-                    if parsed.get("type") != "transfer":
-                        continue
-                    info = parsed.get("info", {})
-                    source = info.get("source")
-                    dest = info.get("destination")
-                    lamports = int(info.get("lamports", 0) or 0)
-                    if not (source and dest and lamports > 0):
-                        continue
-                    if dest == self.central and source in src_map:
-                        uid = src_map[source]
-                        self._mark_seen(sig, uid, lamports)
-                        if self.on_verified_deposit:
-                            self.on_verified_deposit({"user_id": uid, "amount_lamports": lamports, "sig": sig})
-                        return True
-                return None
-
-            # top-level instructions
-            top = msg.get("instructions") or []
-            if scan_instr_list(top):
-                return True
-
-            # inner instructions
-            meta = trx.get("meta") or {}
-            for idx in range(len(meta.get("innerInstructions") or [])):
-                inner = meta["innerInstructions"][idx].get("instructions", [])
-                if scan_instr_list(inner):
-                    return True
-        except Exception as e:
-            print("parsed-instr detection error:", e)
-        return False
-
-    def _try_credit_via_balance_delta(self, trx: dict, src_map: Dict[str,int], sig:str) -> bool:
-        """Fallback using pre/post balances of central and any matching source address."""
-        try:
-            msg = (trx.get("transaction") or {}).get("message", {})
-            meta = trx.get("meta") or {}
-            pre = meta.get("preBalances") or []
-            post = meta.get("postBalances") or []
-            keys = msg.get("accountKeys", [])
-            key_strs = [key_to_str(k) for k in keys]
-
-            # central index
-            try:
-                central_idx = key_strs.index(self.central)
-            except ValueError:
-                return False
-
-            delta_central = post[central_idx] - pre[central_idx] if central_idx < len(pre) and central_idx < len(post) else 0
-            if delta_central <= 0:
-                return False
-
-            for i, addr in enumerate(key_strs):
-                if addr not in src_map:
-                    continue
-                delta_src = pre[i] - post[i] if i < len(pre) and i < len(post) else 0
-                # tolerate fee differences: allow src drop >= central increase *0.95
-                if delta_src >= int(delta_central * 0.95):
-                    uid = src_map[addr]
-                    self._mark_seen(sig, uid, int(delta_central))
-                    if self.on_verified_deposit:
-                        self.on_verified_deposit({"user_id": uid, "amount_lamports": int(delta_central), "sig": sig})
-                    return True
-        except Exception as e:
-            print("balance-delta detection error:", e)
-        return False
+            # Gutschreiben & markieren
+            self._mark_seen(sig, uid, amount)
+            if self.on_verified_deposit:
+                self.on_verified_deposit({"user_id": uid, "amount_lamports": amount, "sig": sig})
 
 # ------------------------ CONNECTOR STUBS ------------------------
 
@@ -509,7 +485,7 @@ ADMIN_AWAIT_SIMPLE_CALL: Dict[int, bool] = {}
 ADMIN_AWAIT_BALANCE_EDIT: Dict[int, bool] = {}
 ADMIN_AWAIT_TRADE_STATUS: Dict[int, bool] = {}
 
-watcher = CentralWatcher(SOLANA_RPC, CENTRAL_SOL_PUBKEY)
+watcher = CentralWatcher(CENTRAL_SOL_PUBKEY)
 
 def _on_verified_deposit(evt:dict):
     uid = evt["user_id"]
@@ -588,12 +564,7 @@ def on_cb(c:CallbackQuery):
             f"{px}\n\n"
             "_Nur Überweisungen von deiner Absender-Wallet werden gutgeschrieben._"
         )
-        bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_deposit_copy())
-        return
-
-    if data == "copy_central_addr":
-        bot.answer_callback_query(c.id, "Adresse gesendet.")
-        bot.send_message(c.message.chat.id, f"`{CENTRAL_SOL_PUBKEY}`", parse_mode="Markdown")
+        bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
         return
 
     if data == "withdraw":
@@ -715,7 +686,7 @@ def on_cb(c:CallbackQuery):
             "Format:\n"
             "- Einzelner Nutzer: `UID AMOUNT_SOL [NOTIZ]`\n"
             "- Alle Abonnenten:  `all AMOUNT_SOL [NOTIZ]`\n"
-            "- Prozent für alle:  `all +5% Bonus` oder `all -3% SL`",
+            "- Prozent für alle:  `all +5%` oder `all -3%`",
             parse_mode="Markdown")
         ADMIN_AWAIT_BALANCE_EDIT[uid] = True
         return
@@ -780,6 +751,16 @@ def on_cb(c:CallbackQuery):
 
 # ------------------------ MESSAGE HANDLERS ------------------------
 
+def is_probably_solana_address(addr: str) -> bool:
+    # einfache Validierung (Base58-ähnlich, Längencheck)
+    if not isinstance(addr, str):
+        return False
+    addr = addr.strip()
+    if len(addr) < 32 or len(addr) > 44:
+        return False
+    allowed = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    return all(ch in allowed for ch in addr)
+
 @bot.message_handler(func=lambda m: True)
 def catch_all(m:Message):
     uid = m.from_user.id
@@ -787,10 +768,8 @@ def catch_all(m:Message):
     if WAITING_SOURCE_WALLET.get(uid, False):
         WAITING_SOURCE_WALLET[uid] = False
         wallet = (m.text or "").strip()
-        try:
-            Pubkey.from_string(wallet)
-        except Exception:
-            bot.reply_to(m, "Bitte eine gültige Solana-Adresse eingeben.")
+        if not is_probably_solana_address(wallet):
+            bot.reply_to(m, "Bitte *eine gültige Solana-Adresse* eingeben.", parse_mode="Markdown")
             return
         set_source_wallet(uid, wallet)
         price = get_sol_usd()
@@ -834,7 +813,7 @@ def catch_all(m:Message):
             bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. `0.25`.", parse_mode="Markdown")
         return
 
-    # Admin simple call
+    # Admin: einfacher Call?
     if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
         ADMIN_AWAIT_SIMPLE_CALL[uid] = False
         if not is_admin(uid):
@@ -860,7 +839,7 @@ def catch_all(m:Message):
             bot.reply_to(m, "Formatfehler. Siehe Beispiel.", parse_mode="Markdown")
         return
 
-    # Admin balance edit
+    # Admin: Balance edit?
     if ADMIN_AWAIT_BALANCE_EDIT.get(uid, False):
         ADMIN_AWAIT_BALANCE_EDIT[uid] = False
         if not is_admin(uid):
@@ -916,7 +895,7 @@ def catch_all(m:Message):
             bot.reply_to(m, "Fehler beim Parsen. Siehe Beispiele oben.")
         return
 
-    # Admin trade status
+    # Admin: Trade-Status?
     if ADMIN_AWAIT_TRADE_STATUS.get(uid, False):
         ADMIN_AWAIT_TRADE_STATUS[uid] = False
         if not is_admin(uid):
@@ -981,6 +960,7 @@ def auto_executor_loop():
                     con.execute("UPDATE executions SET status=?, txid=?, message=? WHERE id=?",
                                 (status, txid, str(result), r["eid"]))
 
+                # kleine P&L-Simulation
                 risk = (r["auto_risk"] or "MEDIUM").upper()
                 pnl_frac = {"LOW":0.01, "MEDIUM":0.0, "HIGH":0.02}.get(risk, 0.0)
                 pnl = int(stake_lamports * pnl_frac)
@@ -999,7 +979,7 @@ def auto_executor_loop():
                         f"`{txid}`",
                         parse_mode="Markdown")
                 except Exception as e:
-                    print("notify exec error", e)
+                    print("notify exec error:", e)
         except Exception as e:
             print("executor loop error:", e)
         time.sleep(5)
