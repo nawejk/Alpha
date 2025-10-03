@@ -36,7 +36,7 @@ from solana.rpc.types import RPCResponse
 
 # ------------------------ CONFIG ------------------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAGfMucPHJ0BtZPPVhgZkWtzYCHnu7SZMoo").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAEfOzr7e8EMyNi_8wjm7bndwk-cxZBvTRw").strip()
 if not BOT_TOKEN or BOT_TOKEN == "REPLACE_ME":
     raise RuntimeError("BOT_TOKEN env missing")
 
