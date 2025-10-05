@@ -472,7 +472,7 @@ def dex_market_buy_simulated(user_id:int, base:str, amount_lamports:int):
     return {"status":"FILLED", "txid":"SIM-TX-"+base, "spent_lamports": amount_lamports}
 
 def futures_place_simulated(user_id:int, base:str, side:str, leverage:str, risk:str):
-    return {"status":"FILLED", "order_id":"Live-ORDER", "base":base, "side":side, "lev":leverage, "risk":risk}
+    return {"status":"FILLED", "order_id":"Sim-ORDER", "base":base, "side":side, "lev":leverage, "risk":risk}
 
 # ------------------------ BOT ------------------------
 
