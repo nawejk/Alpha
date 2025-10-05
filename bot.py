@@ -1,18 +1,8 @@
-# bot_single.py
+bot_single.py
 # Signals & Auto-Entry Bot — Central-Deposit + Live USDC (RAW RPC)
 #
-# Änderungen (genau nach Wunsch):
-# - Einzahlung nutzt NUR die zentrale Adresse (CENTRAL_SOL_PUBKEY).
-# - User MUSS zuerst seine Absender-Wallet angeben.
-# - Watcher scannt die zentrale Adresse via RPC (getSignaturesForAddress/getTransaction, jsonParsed)
-#   und schreibt Guthaben gut, wenn Quelle == Absender-Wallet.
-# - Neben SOL-Beträgen wird der Live-Preis in USDC angezeigt.
-# - KEINE Imports von solana/solders/PublicKey/etc.
-# - Zentrale Adresse wird als <code>...</code> bzw. Markdown-Backticks angezeigt (leicht kopierbar).
-# - Hinweis: Einzahlungen werden NUR erkannt, wenn sie aus Wallet-Apps wie Phantom / Solflare / Backpack etc. kommen.
-#            Einzahlungen von Börsen (z. B. Coinbase, MEXC, Bitget, Binance etc.) werden NICHT automatisch erkannt.
-# - Auszahlung: Button zum Setzen einer Auszahlungs-Wallet hinzugefügt.
-# - Keine Texte/Bezeichner mehr mit "simuliert" oder "SIM-".
+# Änderungen (nur zur Behebung der Telegram-Entity-Fehler):
+# - parse_mode überall deaktiviert (None), sonst keine Logikänderungen.
 #
 # Setup:
 #   pip install pyTelegramBotAPI requests python-dotenv pytz
@@ -490,7 +480,7 @@ def futures_place(user_id:int, base:str, side:str, leverage:str, risk:str):
 # ------------------------ BOT ------------------------
 
 init_db()
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
 WAITING_SOURCE_WALLET: Dict[int, bool] = {}
 WAITING_WITHDRAW_AMOUNT: Dict[int, bool] = {}
@@ -514,7 +504,7 @@ def _on_verified_deposit(evt:dict):
             "_Einzahlungen von Börsen (Coinbase, MEXC, Bitget, Binance etc.) werden nicht automatisch erkannt._\n\n"
             f"Betrag: {fmt_sol_usdc(lam)}\n"
             f"Neues Guthaben: *{fmt_sol_usdc(new_bal)}*",
-            parse_mode="Markdown")
+            parse_mode=None)
     except Exception as e:
         print("notify deposit error:", e)
 
@@ -538,7 +528,7 @@ def cmd_start(m:Message):
     admin_flag = 1 if is_admin(uid) else 0
     upsert_user(uid, uname, admin_flag)
     u = get_user(uid)
-    bot.reply_to(m, home_text(u), reply_markup=kb_main(u))
+    bot.reply_to(m, home_text(u), reply_markup=kb_main(u), parse_mode=None)
 
 # ------------------------ CALLBACKS ------------------------
 
@@ -550,7 +540,7 @@ def on_cb(c:CallbackQuery):
 
     if data == "back_home":
         u = get_user(uid)
-        bot.edit_message_text(home_text(u), c.message.chat.id, c.message.message_id, reply_markup=kb_main(u))
+        bot.edit_message_text(home_text(u), c.message.chat.id, c.message.message_id, reply_markup=kb_main(u), parse_mode=None)
         return
 
     if data == "help":
@@ -565,14 +555,14 @@ def on_cb(c:CallbackQuery):
             "3) *Auto-Entry*: ON/OFF. Risiko (Low/Medium/High) steuert Einsatz (5/10/20%).\n"
             "4) *Auszahlung*: Betrag in SOL eingeben; Admin bestätigt & sendet.\n"
             "5) *Auszahlungs-Wallet*: Lege hier deine Ziel-Wallet für Auszahlungen fest.",
-            c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
+            c.message.chat.id, c.message.message_id, parse_mode=None, reply_markup=kb_main(u))
         return
 
     if data == "deposit":
         if not u["source_wallet"]:
             WAITING_SOURCE_WALLET[uid] = True
             bot.answer_callback_query(c.id, "Bitte zuerst deine Absender-Wallet senden.")
-            bot.send_message(c.message.chat.id, "Gib jetzt *deine Absender-Wallet (SOL)* ein:", parse_mode="Markdown")
+            bot.send_message(c.message.chat.id, "Gib jetzt *deine Absender-Wallet (SOL)* ein:", parse_mode=None)
             return
         bot.answer_callback_query(c.id, "Adresse angezeigt.")
         price = get_sol_usd()
@@ -586,13 +576,13 @@ def on_cb(c:CallbackQuery):
             "*Wichtig:* Einzahlungen aus Wallet-Apps (Phantom / Solflare / Backpack etc.) werden erkannt.\n"
             "_Überweisungen von Börsen wie Coinbase, MEXC, Bitget, Binance etc. werden nicht automatisch erkannt._"
         )
-        bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
+        bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode=None, reply_markup=kb_main(u))
         return
 
     if data == "set_withdraw_wallet":
         WAITING_WITHDRAW_WALLET[uid] = True
         bot.answer_callback_query(c.id, "Bitte Ziel-Wallet senden.")
-        bot.send_message(c.message.chat.id, "🏦 *Auszahlungs-Wallet setzen*\nSende jetzt die *Solana-Adresse*, auf die wir Auszahlungen schicken sollen.", parse_mode="Markdown")
+        bot.send_message(c.message.chat.id, "🏦 *Auszahlungs-Wallet setzen*\nSende jetzt die *Solana-Adresse*, auf die wir Auszahlungen schicken sollen.", parse_mode=None)
         return
 
     if data == "withdraw":
@@ -606,7 +596,7 @@ def on_cb(c:CallbackQuery):
             "💳 *Auszahlung*\n"
             f"Aktuelle Ziel-Wallet: `{ww}`\n"
             "Gib den Betrag in SOL ein (z. B. `0.25`).",
-            parse_mode="Markdown",
+            parse_mode=None,
             reply_markup=kb
         )
         return
@@ -618,17 +608,17 @@ def on_cb(c:CallbackQuery):
             return
         set_subscription(uid, True)
         bot.answer_callback_query(c.id, "Abo aktiviert")
-        bot.edit_message_text("🔔 Abo ist *aktiv*.", c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
+        bot.edit_message_text("🔔 Abo ist *aktiv*.", c.message.chat.id, c.message.message_id, parse_mode=None, reply_markup=kb_main(u))
         return
 
     if data == "sub_off":
         set_subscription(uid, False)
         bot.answer_callback_query(c.id, "Abo beendet")
-        bot.edit_message_text("🔕 Abo *beendet*.", c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
+        bot.edit_message_text("🔕 Abo *beendet*.", c.message.chat.id, c.message.message_id, parse_mode=None, reply_markup=kb_main(u))
         return
 
     if data == "auto_menu":
-        bot.edit_message_text("⚙️ Auto-Entry Einstellungen:", c.message.chat.id, c.message.message_id, reply_markup=kb_auto(u))
+        bot.edit_message_text("⚙️ Auto-Entry Einstellungen:", c.message.chat.id, c.message.message_id, reply_markup=kb_auto(u), parse_mode=None)
         return
 
     if data.startswith("auto_"):
@@ -638,7 +628,7 @@ def on_cb(c:CallbackQuery):
         set_auto_mode(uid, mode)
         bot.answer_callback_query(c.id, f"Auto-Entry: {mode}")
         nu = get_user(uid)
-        bot.edit_message_text(f"Auto-Entry: *{mode}*", c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_auto(nu))
+        bot.edit_message_text(f"Auto-Entry: *{mode}*", c.message.chat.id, c.message.message_id, parse_mode=None, reply_markup=kb_auto(nu))
         return
 
     if data.startswith("risk_"):
@@ -646,7 +636,7 @@ def on_cb(c:CallbackQuery):
         set_auto_risk(uid, risk)
         bot.answer_callback_query(c.id, f"Risk: {risk}")
         nu = get_user(uid)
-        bot.edit_message_text("Auto-Entry aktualisiert.", c.message.chat.id, c.message.message_id, reply_markup=kb_auto(nu))
+        bot.edit_message_text("Auto-Entry aktualisiert.", c.message.chat.id, c.message.message_id, reply_markup=kb_auto(nu), parse_mode=None)
         return
 
     if data == "risk_info":
@@ -656,7 +646,7 @@ def on_cb(c:CallbackQuery):
             "- *LOW*: Kleiner Einsatz, kleinere Gewinne, stabiler.\n"
             "- *MEDIUM*: Ausgewogen.\n"
             "- *HIGH*: Größerer Einsatz, potenziell höhere Gewinne, aber mehr Risiko.",
-            parse_mode="Markdown")
+            parse_mode=None)
         return
 
     # ----- Admin -----
@@ -664,7 +654,7 @@ def on_cb(c:CallbackQuery):
         if not is_admin(uid):
             bot.answer_callback_query(c.id, "Nicht erlaubt.")
             return
-        bot.edit_message_text("🛠 Admin-Menü", c.message.chat.id, c.message.message_id, reply_markup=kb_admin())
+        bot.edit_message_text("🛠 Admin-Menü", c.message.chat.id, c.message.message_id, reply_markup=kb_admin(), parse_mode=None)
         return
 
     if data == "admin_list_investors":
@@ -680,7 +670,7 @@ def on_cb(c:CallbackQuery):
                 f"  Source: `{r['source_wallet'] or '-'}` • Withdraw: `{r['withdraw_wallet'] or '-'}`"
             )
         bot.answer_callback_query(c.id)
-        bot.send_message(c.message.chat.id, "\n".join(parts), parse_mode="Markdown")
+        bot.send_message(c.message.chat.id, "\n".join(parts), parse_mode=None)
         return
 
     if data == "admin_new_call_simple":
@@ -691,7 +681,7 @@ def on_cb(c:CallbackQuery):
             "Sende den Call *einfach* im Format:\n"
             "- FUTURES: `FUTURES|BASE|SIDE|LEV`   (z. B. `FUTURES|SOL|LONG|20x`)\n"
             "- MEME:    `MEME|NAME_OR_SYMBOL|TOKEN_ADDRESS`",
-            parse_mode="Markdown")
+            parse_mode=None)
         ADMIN_AWAIT_SIMPLE_CALL[uid] = True
         return
 
@@ -707,7 +697,7 @@ def on_cb(c:CallbackQuery):
         sent = 0
         for su in subs:
             try:
-                bot.send_message(su, msg, parse_mode="Markdown")
+                bot.send_message(su, msg, parse_mode=None)
                 queue_execution(row["id"], su, status="QUEUED", message="Queued by broadcast")
                 sent += 1
             except Exception as e:
@@ -725,7 +715,7 @@ def on_cb(c:CallbackQuery):
             "- Einzelner Nutzer: `UID AMOUNT_SOL [NOTIZ]`\n"
             "- Alle Abonnenten:  `all AMOUNT_SOL [NOTIZ]`\n"
             "- Prozent für alle:  `all +5%` oder `all -3%`",
-            parse_mode="Markdown")
+            parse_mode=None)
         ADMIN_AWAIT_BALANCE_EDIT[uid] = True
         return
 
@@ -743,7 +733,7 @@ def on_cb(c:CallbackQuery):
                    f"Ziel-Wallet: `{r['withdraw_wallet'] or '-nicht gesetzt-'}`\n"
                    f"Status: `{r['status']}`\n"
                    f"Notiz: {r['note'] or '-'}")
-            bot.send_message(c.message.chat.id, txt, parse_mode="Markdown", reply_markup=kb_payout_manage(r["id"]))
+            bot.send_message(c.message.chat.id, txt, parse_mode=None, reply_markup=kb_payout_manage(r["id"]))
         return
 
     if data == "admin_trade_status":
@@ -754,7 +744,7 @@ def on_cb(c:CallbackQuery):
             "📈 *Trade-Status senden*\n"
             "Kurze Nachricht (z. B. `Trade gestartet`, `TP1`, `SL`, `Liquidated`).\n"
             "Wird an *alle Abonnenten* gesendet.",
-            parse_mode="Markdown")
+            parse_mode=None)
         ADMIN_AWAIT_TRADE_STATUS[uid] = True
         return
 
@@ -772,19 +762,19 @@ def on_cb(c:CallbackQuery):
             with get_db() as con:
                 con.execute("UPDATE payouts SET status='APPROVED' WHERE id=?", (pid,))
             bot.answer_callback_query(c.id, "Genehmigt.")
-            try: bot.send_message(row["user_id"], "✅ Deine Auszahlung wurde *genehmigt*. Bitte kurz Geduld.", parse_mode="Markdown")
+            try: bot.send_message(row["user_id"], "✅ Deine Auszahlung wurde *genehmigt*. Bitte kurz Geduld.", parse_mode=None)
             except: pass
         elif action == "SENT":
             with get_db() as con:
                 con.execute("UPDATE payouts SET status='SENT' WHERE id=?", (pid,))
             bot.answer_callback_query(c.id, "Als gesendet markiert.")
-            try: bot.send_message(row["user_id"], "📤 Deine Auszahlung wurde *gesendet*.", parse_mode="Markdown")
+            try: bot.send_message(row["user_id"], "📤 Deine Auszahlung wurde *gesendet*.", parse_mode=None)
             except: pass
         elif action == "REJECT":
             with get_db() as con:
                 con.execute("UPDATE payouts SET status='REJECTED' WHERE id=?", (pid,))
             bot.answer_callback_query(c.id, "Abgelehnt.")
-            try: bot.send_message(row["user_id"], "❌ Deine Auszahlung wurde *abgelehnt*.", parse_mode="Markdown")
+            try: bot.send_message(row["user_id"], "❌ Deine Auszahlung wurde *abgelehnt*.", parse_mode=None)
             except: pass
         return
 
@@ -808,7 +798,7 @@ def catch_all(m:Message):
         WAITING_SOURCE_WALLET[uid] = False
         wallet = (m.text or "").strip()
         if not is_probably_solana_address(wallet):
-            bot.reply_to(m, "Bitte *eine gültige Solana-Adresse* eingeben.", parse_mode="Markdown")
+            bot.reply_to(m, "Bitte *eine gültige Solana-Adresse* eingeben.", parse_mode=None)
             return
         set_source_wallet(uid, wallet)
         price = get_sol_usd()
@@ -822,7 +812,7 @@ def catch_all(m:Message):
             "_Nur Überweisungen von deiner Absender-Wallet werden gutgeschrieben._\n"
             "*Wichtig:* Einzahlungen aus Wallet-Apps (Phantom / Solflare / Backpack etc.) werden erkannt.\n"
             "_Überweisungen von Börsen wie Coinbase, MEXC, Bitget, Binance etc. werden nicht automatisch erkannt._",
-            parse_mode="Markdown")
+            parse_mode=None)
         return
 
     # State: Auszahlungs-Wallet?
@@ -830,10 +820,10 @@ def catch_all(m:Message):
         WAITING_WITHDRAW_WALLET[uid] = False
         wallet = (m.text or "").strip()
         if not is_probably_solana_address(wallet):
-            bot.reply_to(m, "Bitte *eine gültige Solana-Adresse* eingeben.", parse_mode="Markdown")
+            bot.reply_to(m, "Bitte *eine gültige Solana-Adresse* eingeben.", parse_mode=None)
             return
         set_withdraw_wallet(uid, wallet)
-        bot.reply_to(m, f"✅ Auszahlungs-Wallet gespeichert:\n`{wallet}`", parse_mode="Markdown")
+        bot.reply_to(m, f"✅ Auszahlungs-Wallet gespeichert:\n`{wallet}`", parse_mode=None)
         return
 
     # State: Auszahlung?
@@ -843,11 +833,11 @@ def catch_all(m:Message):
             txt = (m.text or "").replace(",", ".").strip()
             sol = float(txt)
             if sol <= 0:
-                bot.reply_to(m, "Betrag muss > 0 sein.")
+                bot.reply_to(m, "Betrag muss > 0 sein.", parse_mode=None)
                 return
             lam = int(sol * LAMPORTS_PER_SOL)
             if not subtract_balance(uid, lam):
-                bot.reply_to(m, f"Unzureichendes Guthaben. Verfügbar: {fmt_sol_usdc(get_balance_lamports(uid))}")
+                bot.reply_to(m, f"Unzureichendes Guthaben. Verfügbar: {fmt_sol_usdc(get_balance_lamports(uid))}", parse_mode=None)
                 return
             # Ziel-Wallet für Admin-Hinweis
             uinfo = get_user(uid)
@@ -856,55 +846,55 @@ def catch_all(m:Message):
             with get_db() as con:
                 cur = con.execute("INSERT INTO payouts(user_id, amount_lamports, note) VALUES (?,?,?)", (uid, lam, note))
                 pid = cur.lastrowid
-            bot.reply_to(m, f"✅ Auszahlungsanfrage erstellt: *{fmt_sol_usdc(lam)}*.\nZiel-Wallet: `{target_wallet}`\nEin Admin prüft und sendet zeitnah.", parse_mode="Markdown")
+            bot.reply_to(m, f"✅ Auszahlungsanfrage erstellt: *{fmt_sol_usdc(lam)}*.\nZiel-Wallet: `{target_wallet}`\nEin Admin prüft und sendet zeitnah.", parse_mode=None)
             for aid in ADMIN_IDS:
                 try:
                     bot.send_message(int(aid),
                         f"🧾 *Neue Auszahlung #{pid}*\nUser: `{uid}`\nBetrag: *{fmt_sol_usdc(lam)}*\nZiel-Wallet: `{target_wallet}`",
-                        parse_mode="Markdown", reply_markup=kb_payout_manage(pid))
+                        parse_mode=None, reply_markup=kb_payout_manage(pid))
                 except Exception as e:
                     print("notify admin payout error:", e)
         except Exception:
-            bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. `0.25`.", parse_mode="Markdown")
+            bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. `0.25`.", parse_mode=None)
         return
 
     # Admin: einfacher Call?
     if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
         ADMIN_AWAIT_SIMPLE_CALL[uid] = False
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt.")
+            bot.reply_to(m, "Nicht erlaubt.", parse_mode=None)
             return
         raw = (m.text or "").strip()
         parts = [p.strip() for p in raw.split("|")]
         if len(parts) < 2:
-            bot.reply_to(m, "Formatfehler. Siehe Beispiel.", parse_mode="Markdown")
+            bot.reply_to(m, "Formatfehler. Siehe Beispiel.", parse_mode=None)
             return
         t0 = parts[0].upper()
         if t0 == "FUTURES" and len(parts) >= 4:
             _, base, side, lev = parts[:4]
             cid = create_call(uid, "FUTURES", base.upper(), side.upper(), lev, None, "")
             c = get_call(cid)
-            bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode="Markdown")
+            bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode=None)
         elif t0 == "MEME" and len(parts) >= 3:
             _, name_or_symbol, token_addr = parts[:3]
             cid = create_call(uid, "MEME", name_or_symbol.upper(), None, None, token_addr, "")
             c = get_call(cid)
-            bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode="Markdown")
+            bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode=None)
         else:
-            bot.reply_to(m, "Formatfehler. Siehe Beispiel.", parse_mode="Markdown")
+            bot.reply_to(m, "Formatfehler. Siehe Beispiel.", parse_mode=None)
         return
 
     # Admin: Balance edit?
     if ADMIN_AWAIT_BALANCE_EDIT.get(uid, False):
         ADMIN_AWAIT_BALANCE_EDIT[uid] = False
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt.")
+            bot.reply_to(m, "Nicht erlaubt.", parse_mode=None)
             return
         try:
             txt = (m.text or "").strip()
             parts = txt.split(maxsplit=2)
             if len(parts) < 2:
-                bot.reply_to(m, "Formatfehler. Beispiele in der Nachricht.", parse_mode="Markdown")
+                bot.reply_to(m, "Formatfehler. Beispiele in der Nachricht.", parse_mode=None)
                 return
             target, amount_s = parts[0], parts[1]
             note = parts[2] if len(parts) > 2 else ""
@@ -920,7 +910,7 @@ def catch_all(m:Message):
                         if delta > 0: add_balance(r["user_id"], delta)
                         else: subtract_balance(r["user_id"], -delta)
                         cnt += 1
-                bot.reply_to(m, f"✅ {cnt} Abonnenten angepasst ({amount_s}). {note}")
+                bot.reply_to(m, f"✅ {cnt} Abonnenten angepasst ({amount_s}). {note}", parse_mode=None)
                 return
             sol = float(amount_s)
             lam = int(sol * LAMPORTS_PER_SOL)
@@ -932,43 +922,43 @@ def catch_all(m:Message):
                     if lam >= 0: add_balance(r["user_id"], lam)
                     else: subtract_balance(r["user_id"], -lam)
                     cnt += 1
-                bot.reply_to(m, f"✅ Guthaben bei {cnt} Abonnenten geändert: {fmt_sol_usdc(lam)}. {note}")
+                bot.reply_to(m, f"✅ Guthaben bei {cnt} Abonnenten geändert: {fmt_sol_usdc(lam)}. {note}", parse_mode=None)
             else:
                 tuid = int(target)
                 if lam >= 0: add_balance(tuid, lam)
                 else:
                     ok = subtract_balance(tuid, -lam)
                     if not ok:
-                        bot.reply_to(m, "Unzureichendes Guthaben beim Zielnutzer.")
+                        bot.reply_to(m, "Unzureichendes Guthaben beim Zielnutzer.", parse_mode=None)
                         return
                 nb = fmt_sol_usdc(get_balance_lamports(tuid))
-                bot.reply_to(m, f"✅ Guthaben geändert: {tuid} {fmt_sol_usdc(lam)} • Neues Guthaben: {nb}. {note}")
+                bot.reply_to(m, f"✅ Guthaben geändert: {tuid} {fmt_sol_usdc(lam)} • Neues Guthaben: {nb}. {note}", parse_mode=None)
                 try:
-                    bot.send_message(tuid, f"📒 Admin-Anpassung: {fmt_sol_usdc(lam)}\nNeues Guthaben: {nb}\n{note}")
+                    bot.send_message(tuid, f"📒 Admin-Anpassung: {fmt_sol_usdc(lam)}\nNeues Guthaben: {nb}\n{note}", parse_mode=None)
                 except: pass
         except Exception as e:
-            bot.reply_to(m, "Fehler beim Parsen. Siehe Beispiele oben.")
+            bot.reply_to(m, "Fehler beim Parsen. Siehe Beispiele oben.", parse_mode=None)
         return
 
     # Admin: Trade-Status?
     if ADMIN_AWAIT_TRADE_STATUS.get(uid, False):
         ADMIN_AWAIT_TRADE_STATUS[uid] = False
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt.")
+            bot.reply_to(m, "Nicht erlaubt.", parse_mode=None)
             return
         msg = (m.text or "").strip()
         if not msg:
-            bot.reply_to(m, "Bitte Text senden.")
+            bot.reply_to(m, "Bitte Text senden.", parse_mode=None)
             return
         subs = all_subscribers()
         sent = 0
         for su in subs:
             try:
-                bot.send_message(su, f"📢 *Trade-Update*: {msg}", parse_mode="Markdown")
+                bot.send_message(su, f"📢 *Trade-Update*: {msg}", parse_mode=None)
                 sent += 1
             except Exception as e:
                 print("trade status broadcast error", su, e)
-        bot.reply_to(m, f"✅ Trade-Status gesendet an {sent} Abonnenten.")
+        bot.reply_to(m, f"✅ Trade-Status gesendet an {sent} Abonnenten.", parse_mode=None)
         return
 
 # ------------------------ AUTO EXECUTOR ------------------------
@@ -1032,7 +1022,7 @@ def auto_executor_loop():
                         f"Einsatz: {fmt_sol_usdc(stake_lamports)} | P&L: {fmt_sol_usdc(pnl)}\n"
                         f"Guthaben: *{fmt_sol_usdc(bal_after)}*\n"
                         f"`{txid}`",
-                        parse_mode="Markdown")
+                        parse_mode=None)
                 except Exception as e:
                     print("notify exec error:", e)
         except Exception as e:
@@ -1055,7 +1045,7 @@ def payout_reminder_loop():
                     try:
                         bot.send_message(int(aid),
                             f"⏰ Erinnerung: Auszahlung #{r['id']} offen • Betrag {fmt_sol_usdc(r['amount_lamports'])}",
-                            reply_markup=kb_payout_manage(r["id"]))
+                            reply_markup=kb_payout_manage(r["id"]), parse_mode=None)
                     except Exception as e:
                         print("payout remind error:", e)
                 with get_db() as con:
