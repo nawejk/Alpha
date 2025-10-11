@@ -1,2 +1,5 @@
-pyTelegramBotAPI==4.21.0
-requests==2.32.3
+pyTelegramBotAPI==4.22.1
+solana==0.34.0
+solders==0.26.0
+requests>=2.31.0
+pytz
