@@ -6,7 +6,7 @@ from datetime import datetime
 
 import telebot
 from solana.rpc.api import Client
-from solana.keypair import Keypair
+from solders.keypair import Keypair
 from solana.transaction import Transaction
 from solana.system_program import TransferParams, transfer
 from solana.publickey import PublicKey
