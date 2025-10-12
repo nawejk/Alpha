@@ -8,12 +8,12 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # Telegram Bot Token
-BOT_TOKEN = "DEIN_BOT_TOKEN_HIER"
+BOT_TOKEN = "8230882985:AAG2nTU_mjN3fYW_ePARVjmEK9LgF9F6WPA"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Deine zentrale Wallet (wo Einzahlungen landen)
 CENTRAL_WALLET_SECRET = bytes([...])  # Secret Key als Byte-Liste
-central_wallet = Keypair.from_secret_key(CENTRAL_WALLET_SECRET)
+central_wallet = Keypair.from_secret_key([247,105,243,42,159,49,192,11,168,230,147,154,20,64,172,172,55,88,32,225,42,150,203,111,177,237,32,172,248,22,100,233,103,203,1,201,7,76,92,212,84,251,102,164,34,51,81,236,127,194,99,190,137,57,106,254,227,3,133,2,66,111,80,255])
 
 # RPC Client für Mainnet
 solana_client = Client("https://api.mainnet-beta.solana.com")
