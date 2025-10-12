@@ -882,7 +882,7 @@ def auto_executor_loop():
                 frac = risk_to_fraction(r["auto_risk"] or "MEDIUM")
                 stake_info = max(int(r["sol_balance_lamports"] * frac), int(0.01 * LAMPORTS_PER_SOL))
                 if call["market_type"] == "FUTURES":
-                    result = futures_place_simulated(r["user_id"], call["base"], call["side"], call["leverage"], r["auto_risk"
+                    result = futures_place_simulated(r["user_id"], call["base"], call["side"], call["leverage"], r["auto_risk"]
                 else:
                     result = dex_market_buy_simulated(r["user_id"], call["base"], stake_info)
                 status = "FILLED"
