@@ -20,7 +20,7 @@ if not BOT_TOKEN or BOT_TOKEN == "REPLACE_ME":
 
 ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "7919108078").split(",") if a.strip()]
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
-CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy").strip()
+CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "2we5xGu1eB7K24LKyU1AK3vu3GqPrt3RwoQhEXCPWoTL").strip()
 
 DB_PATH = "memebot.db"
 LAMPORTS_PER_SOL = 1_000_000_000
