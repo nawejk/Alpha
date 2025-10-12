@@ -1,155 +1,83 @@
-import telebot
-from telebot import types
-import sqlite3
-from solders.keypair import Keypair
-from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import TxOpts
+import os
+from solana.rpc.api import Client
+from solana.keypair import Keypair
+from solana.publickey import PublicKey
 from solana.transaction import Transaction
 from solana.system_program import TransferParams, transfer
-import asyncio
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ================== CONFIG ==================
-BOT_TOKEN = "8230882985:AAG2nTU_mjN3fYW_ePARVjmEK9LgF9F6WPA"
-SOLANA_RPC = "https://api.mainnet-beta.solana.com"
-SIGNER_FILE = "solana_key.txt"
-
+# Telegram Bot Token
+BOT_TOKEN = "DEIN_BOT_TOKEN_HIER"
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ================== DATABASE ==================
-conn = sqlite3.connect("db.sqlite", check_same_thread=False)
-cursor = conn.cursor()
+# Deine zentrale Wallet (wo Einzahlungen landen)
+CENTRAL_WALLET_SECRET = bytes([...])  # Secret Key als Byte-Liste
+central_wallet = Keypair.from_secret_key(CENTRAL_WALLET_SECRET)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users(
-    id INTEGER PRIMARY KEY,
-    solana_wallet TEXT,
-    balance REAL DEFAULT 0
-)
-""")
+# RPC Client für Mainnet
+solana_client = Client("https://api.mainnet-beta.solana.com")
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS listings(
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER,
-    title TEXT,
-    price REAL,
-    sold INTEGER DEFAULT 0,
-    buyer_id INTEGER
-)
-""")
-conn.commit()
+# Dictionary zum Speichern temporärer User-Daten
+user_sessions = {}
 
-# ================== SOLANA SIGNER ==================
-def load_signer():
-    with open(SIGNER_FILE, "r") as f:
-        secret_bytes = bytes.fromhex(f.read().strip())
-    return Keypair.from_bytes(secret_bytes)
-
-signer = load_signer()
-
-# ================== SOLANA PAYMENT ==================
-async def send_solana(to_pubkey: str, amount: float):
-    async with AsyncClient(SOLANA_RPC) as client:
-        tx = Transaction()
-        tx.add(
-            transfer(
-                TransferParams(
-                    from_pubkey=signer.pubkey(),
-                    to_pubkey=to_pubkey,
-                    lamports=int(amount * 1_000_000_000)
-                )
+# --- Helfer-Funktion: SOL senden ---
+def send_sol(sender: Keypair, receiver: PublicKey, lamports: int):
+    tx = Transaction()
+    tx.add(
+        transfer(
+            TransferParams(
+                from_pubkey=sender.public_key,
+                to_pubkey=receiver,
+                lamports=lamports
             )
         )
-        resp = await client.send_transaction(tx, signer, opts=TxOpts(skip_preflight=True))
-        await client.confirm_transaction(resp.value)
-        return resp.value
+    )
+    res = solana_client.send_transaction(tx, sender)
+    return res
 
-async def check_incoming_payments():
-    async with AsyncClient(SOLANA_RPC) as client:
-        # Hier prüfen wir Transaktionen an die Bot-Wallet
-        # Für Demo: wir durchlaufen alle Listings, die einen Käufer haben aber noch nicht bezahlt wurden
-        listings = cursor.execute("SELECT id, buyer_id, price, sold FROM listings WHERE buyer_id IS NOT NULL AND sold=0").fetchall()
-        for listing in listings:
-            buyer_id = listing[1]
-            amount = listing[2]
-            # Hier vereinfachte Prüfung: Wenn der User Guthaben hat, setzen wir Zahlung als erledigt
-            balance = cursor.execute("SELECT balance FROM users WHERE id=?", (buyer_id,)).fetchone()
-            if balance and balance[0] >= amount:
-                await release_payment(listing[0])
-
-# ================== ESCROW ==================
-async def release_payment(listing_id):
-    listing = cursor.execute("SELECT user_id, price, sold FROM listings WHERE id=?", (listing_id,)).fetchone()
-    if listing and listing[2] == 0:
-        seller_id = listing[0]
-        price = listing[1]
-        seller_wallet = cursor.execute("SELECT solana_wallet FROM users WHERE id=?", (seller_id,)).fetchone()[0]
-        if seller_wallet:
-            await send_solana(seller_wallet, price)
-            cursor.execute("UPDATE listings SET sold=1 WHERE id=?", (listing_id,))
-            conn.commit()
-
-# ================== TELEGRAM HANDLER ==================
+# --- Start / Menü ---
 @bot.message_handler(commands=["start"])
-def start(msg):
-    bot.send_message(msg.chat.id, "Willkommen! Menü: /menu")
+def start(message):
+    user_id = message.from_user.id
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("💰 Geld einzahlen", callback_data="deposit"))
+    markup.add(InlineKeyboardButton("🛒 Verkauf erstellen", callback_data="sell"))
+    bot.send_message(user_id, "Willkommen! Wähle eine Option:", reply_markup=markup)
 
-@bot.message_handler(commands=["menu"])
-def menu(msg):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🆕 Neue Anzeige", callback_data="new_listing"))
-    markup.add(types.InlineKeyboardButton("📋 Anzeigen ansehen", callback_data="view_listings"))
-    markup.add(types.InlineKeyboardButton("💰 Mein Guthaben", callback_data="my_balance"))
-    bot.send_message(msg.chat.id, "Wähle eine Option:", reply_markup=markup)
+# --- Button Callback ---
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    user_id = call.from_user.id
 
-# ================== CALLBACK HANDLER ==================
-@bot.callback_query_handler(func=lambda c: True)
-def callback(call):
-    if call.data == "new_listing":
-        bot.send_message(call.message.chat.id, "Schicke Titel und Preis: Titel|Preis")
-        bot.register_next_step_handler(call.message, new_listing)
-    elif call.data == "view_listings":
-        listings = cursor.execute("SELECT id, title, price FROM listings WHERE sold=0").fetchall()
-        if not listings:
-            bot.send_message(call.message.chat.id, "Keine Listings verfügbar.")
-        else:
-            markup = types.InlineKeyboardMarkup()
-            for l in listings:
-                markup.add(types.InlineKeyboardButton(f"{l[1]} - {l[2]} SOL", callback_data=f"buy_{l[0]}"))
-            bot.send_message(call.message.chat.id, "Verfügbare Listings:", reply_markup=markup)
-    elif call.data.startswith("buy_"):
-        listing_id = int(call.data.split("_")[1])
-        listing = cursor.execute("SELECT title, price, user_id FROM listings WHERE id=?", (listing_id,)).fetchone()
-        buyer_id = call.from_user.id
-        bot.send_message(call.message.chat.id, f"Sende {listing[1]} SOL an die Bot-Wallet für: {listing[0]}")
-        cursor.execute("UPDATE listings SET buyer_id=? WHERE id=?", (buyer_id, listing_id))
-        conn.commit()
-    elif call.data == "my_balance":
-        user_id = call.from_user.id
-        balance = cursor.execute("SELECT balance FROM users WHERE id=?", (user_id,)).fetchone()
-        if not balance:
-            bot.send_message(call.message.chat.id, "Du hast noch kein Guthaben.")
-        else:
-            bot.send_message(call.message.chat.id, f"Dein Guthaben: {balance[0]} SOL")
+    if call.data == "deposit":
+        # Zeige User seine zentrale Wallet-Adresse
+        bot.send_message(user_id, f"Schicke SOL an diese Wallet:\n`{central_wallet.public_key}`", parse_mode="Markdown")
+        bot.send_message(user_id, "Nachdem du gezahlt hast, sende /check, um dein Guthaben zu aktualisieren.")
+    elif call.data == "sell":
+        bot.send_message(user_id, "Gib an, was du verkaufen willst. (Text eingeben)")
+        user_sessions[user_id] = {"action": "selling"}
+    bot.answer_callback_query(call.id)
 
-# ================== NEUE LISTING ==================
-def new_listing(msg):
-    try:
-        title, price = msg.text.split("|")
-        price = float(price)
-        cursor.execute("INSERT INTO listings(user_id, title, price) VALUES(?,?,?)", (msg.from_user.id, title, price))
-        conn.commit()
-        bot.send_message(msg.chat.id, "Anzeige erstellt!")
-    except:
-        bot.send_message(msg.chat.id, "Falsches Format. Nutze: Titel|Preis")
+# --- Text-Handler für Verkauf ---
+@bot.message_handler(func=lambda msg: user_sessions.get(msg.from_user.id, {}).get("action") == "selling")
+def handle_sell(message):
+    user_id = message.from_user.id
+    item_text = message.text
+    # Hier könntest du z.B. in DB speichern
+    bot.send_message(user_id, f"Dein Verkaufseintrag wurde erstellt:\n{item_text}")
+    user_sessions.pop(user_id, None)
 
-# ================== BACKGROUND LOOP ==================
-async def background_loop():
-    while True:
-        await check_incoming_payments()
-        await asyncio.sleep(10)
+# --- Check Balance (optional) ---
+@bot.message_handler(commands=["check"])
+def check_balance(message):
+    user_id = message.from_user.id
+    balance = solana_client.get_balance(central_wallet.public_key)
+    lamports = balance.get("result", {}).get("value", 0)
+    sol_balance = lamports / 1_000_000_000
+    bot.send_message(user_id, f"Dein Guthaben: {sol_balance} SOL")
 
-# ================== START BOT ==================
-loop = asyncio.get_event_loop()
-loop.create_task(background_loop())
-bot.infinity_polling()
+# --- Bot starten ---
+if __name__ == "__main__":
+    print("Bot läuft...")
+    bot.infinity_polling()
