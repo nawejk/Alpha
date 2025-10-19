@@ -281,27 +281,38 @@ def all_subscribers():
         return [r["user_id"] for r in con.execute("SELECT user_id FROM users WHERE sub_active=1").fetchall()]
 
 # =========================
-# Telebot init mit Safe-Send
+# Telebot init mit Safe-Send (FIX)
 # =========================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
+# Speichere Original-Methoden der *Instanz*
+_original_send_message = bot.send_message
+_original_edit_message_text = bot.edit_message_text
+
 def _safe_send_message(chat_id, text, **kwargs):
     try:
-        return bot._Bot__bot.send_message(chat_id, text, **kwargs)
+        return _original_send_message(chat_id, text, **kwargs)
     except Exception:
-        pm = kwargs.get("parse_mode")
-        if pm and str(pm).upper().startswith("MARKDOWN"):
-            kwargs2 = dict(kwargs); kwargs2["parse_mode"] = "Markdown"
-            try:
-                return bot._Bot__bot.send_message(chat_id, md_escape(str(text)), **kwargs2)
-            except Exception:
-                kwargs3 = dict(kwargs2); kwargs3.pop("parse_mode", None)
-                return bot._Bot__bot.send_message(chat_id, str(text), **kwargs3)
-        else:
-            kwargs3 = dict(kwargs); kwargs3.pop("parse_mode", None)
-            return bot._Bot__bot.send_message(chat_id, str(text), **kwargs3)
+        # Fallback: ohne Markdown/ParseMode erneut versuchen
+        kwargs2 = dict(kwargs)
+        kwargs2.pop("parse_mode", None)
+        try:
+            return _original_send_message(chat_id, str(text), **kwargs2)
+        except Exception:
+            # Letzter Versuch: minimal
+            return _original_send_message(chat_id, str(text))
 
+def _safe_edit_message_text(text, chat_id, message_id, **kwargs):
+    try:
+        return _original_edit_message_text(text, chat_id, message_id, **kwargs)
+    except Exception:
+        kwargs2 = dict(kwargs)
+        kwargs2.pop("parse_mode", None)
+        return _original_edit_message_text(str(text), chat_id, message_id, **kwargs2)
+
+# Monkeypatch
 bot.send_message = _safe_send_message
+bot.edit_message_text = _safe_edit_message_text
 
 # =========================
 # Jupiter Live Trading (optional)
