@@ -16,7 +16,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, C
 # =========================
 # Inline-Konfiguration
 # =========================
-BOT_TOKEN = "8410607683:AAEW8DMVuHFSIIcQEnq5-iej37RzCMKe0jw"          # <- dein Bot-Token
+BOT_TOKEN = "8410607683:AAGEErNQv0EUTA6H5INeHXtaCrt_KnG3KI8"          # <- dein Bot-Token
 ADMIN_IDS = ["8076025426"]                                            # Admin-Telegram-IDs
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 CENTRAL_SOL_PUBKEY = "CAYNcLuq8Jybk8GV1e7nCKGK6msAw8ktKSaXDqqBc3f4"  # Zentrale Einzahlungsadresse (nur Info-/UI-Zweck)
