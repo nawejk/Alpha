@@ -22,7 +22,7 @@ if not BOT_TOKEN:
 
 ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") if a.strip()]
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
-CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy").strip()
+CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "5GS7MD9KhNrF65coRL1ybeNQyWJYe5EaFLsbGiSjW16Q").strip()
 
 # Liste bekannter Exchange-Absender (optional, CSV in ENV)
 EXCHANGE_WALLETS = set([s.strip() for s in os.getenv("EXCHANGE_WALLETS", "").split(",") if s.strip()])
