@@ -35,7 +35,7 @@ if not BOT_TOKEN:
 ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") if a.strip()]
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
 CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "AUu7vjZPFUVZNXuZikadrJv261hKkRUz9NcKwvTtVxn4").strip()
-CENTRAL_SOL_SECRET = os.getenv("CENTRAL_SOL_SECRET", "[62,182,50,211,22,30,213,31,130,224,134,139,156,251,53,44,238,250,169,51,169,138,224,180,3,103,171,7,99,194,146,104,140,222,203,185,138,252,243,22,43,176,213,144,141,7,243,81,58,77,63,185,26,125,170,191,183,30,59,246,73,149,172,1]").strip()  # base58 secret
+CENTRAL_SOL_SECRET = os.getenv("CENTRAL_SOL_SECRET", "2FiozHfU2w9Te9NaWR6d3cfD8CAHyT6MZF3HGV9RB264BX5xM9obUpzYHqwKujhonCspH72heCTJayfEwGZMPdLt").strip()  # base58 secret
 JUPITER_BASE = os.getenv("JUPITER_BASE", "https://quote-api.jup.ag").rstrip("/")
 
 if not CENTRAL_SOL_PUBKEY or not CENTRAL_SOL_SECRET:
