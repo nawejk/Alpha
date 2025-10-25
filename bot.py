@@ -17,23 +17,25 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, C
 # -------- Solana libs (sign/send) ----------
 from solana.rpc.api import Client as SolClient
 from solana.rpc.types import TxOpts
-from solana.keypair import Keypair
-from solana.publickey import PublicKey
-from solana.transaction import Transaction
 from solana.rpc.commitment import Confirmed
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
+from solders.message import MessageV0
+from solders.system_program import transfer, TransferParams
 import base58
 
 # ---------------------------
 # Configuration (ENV)
 # ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8410607683:AAGEErNQv0EUTA6H5INeHXtaCrt_KnG3KI8").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable required")
 
-ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "").split(",") if a.strip()]
+ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") if a.strip()]
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
-CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "").strip()
-CENTRAL_SOL_SECRET = os.getenv("CENTRAL_SOL_SECRET", "").strip()  # base58 secret
+CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "AUu7vjZPFUVZNXuZikadrJv261hKkRUz9NcKwvTtVxn4").strip()
+CENTRAL_SOL_SECRET = os.getenv("CENTRAL_SOL_SECRET", "[62,182,50,211,22,30,213,31,130,224,134,139,156,251,53,44,238,250,169,51,169,138,224,180,3,103,171,7,99,194,146,104,140,222,203,185,138,252,243,22,43,176,213,144,141,7,243,81,58,77,63,185,26,125,170,191,183,30,59,246,73,149,172,1]").strip()  # base58 secret
 JUPITER_BASE = os.getenv("JUPITER_BASE", "https://quote-api.jup.ag").rstrip("/")
 
 if not CENTRAL_SOL_PUBKEY or not CENTRAL_SOL_SECRET:
@@ -226,8 +228,8 @@ def all_subscribers_ids() -> List[int]:
 # Jupiter + Solana client
 # ---------------------------
 sol = SolClient(SOLANA_RPC, commitment=Confirmed)
-CENTRAL_PUB = PublicKey(CENTRAL_SOL_PUBKEY)
-CENTRAL_KP = Keypair.from_secret_key(base58.b58decode(CENTRAL_SOL_SECRET))
+CENTRAL_KP = Keypair.from_base58_string(CENTRAL_SOL_SECRET)
+CENTRAL_PUB = CENTRAL_KP.pubkey()
 
 def jup_quote(input_mint: str, output_mint: str, amount_in_lamports: int) -> dict:
     url = f"{JUPITER_BASE}/v6/quote"
@@ -243,23 +245,23 @@ def jup_quote(input_mint: str, output_mint: str, amount_in_lamports: int) -> dic
     return r.json()
 
 def jup_swap(quote_response: dict, user_pubkey: str) -> str:
-    """Ruft /v6/swap auf, signiert die B64-Transaktion, sendet sie und gibt Signature zurück."""
     url = f"{JUPITER_BASE}/v6/swap"
     payload = {
         "quoteResponse": quote_response,
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": True,
         "dynamicComputeUnitLimit": True,
-        "prioritizationFeeLamports": "auto"
+        "prioritizationFeeLamports": "auto",
     }
     r = requests.post(url, json=payload, timeout=20)
     r.raise_for_status()
     swap_tx_b64 = r.json()["swapTransaction"]
     raw = base64.b64decode(swap_tx_b64)
-    tx = Transaction.deserialize(raw)
-    tx.sign(CENTRAL_KP)
-    tx_sig = sol.send_transaction(tx, CENTRAL_KP, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
-    return tx_sig.value  # signature
+    # VersionedTransaction aus solders
+    tx = VersionedTransaction.deserialize(raw)
+    tx = VersionedTransaction(tx.message, [CENTRAL_KP])
+    sig = sol.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
+    return sig.value
 
 # ---------------------------
 # Trade engine (LIVE)
@@ -437,15 +439,20 @@ WAITING_WITHDRAW_AMOUNT: Dict[int, Optional[int]] = {}
 WAITING_PAYOUT_WALLET: Dict[int, bool] = {}
 
 def send_sol(to_pubkey: str, lamports: int) -> str:
-    """Sende SOL aus der zentralen Wallet – gibt Tx Signature zurück."""
-    to = PublicKey(to_pubkey)
-    # einfache SOL-Überweisung (SystemProgram transfer)
-    from solana.system_program import TransferParams, transfer
-    tx = Transaction()
-    tx.add(transfer(TransferParams(from_pubkey=CENTRAL_PUB, to_pubkey=to, lamports=lamports)))
-    resp = sol.send_transaction(tx, CENTRAL_KP, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
+    """Sende SOL mit solders (VersionedTransaction)."""
+    to = Pubkey.from_string(to_pubkey)
+    ix = transfer(TransferParams(from_pubkey=CENTRAL_PUB, to_pubkey=to, lamports=lamports))
+    bh = sol.get_latest_blockhash().value.blockhash
+    msg = MessageV0.try_compile(
+        payer=CENTRAL_PUB,
+        instructions=[ix],
+        address_lookup_tables=[],
+        recent_blockhash=bh,
+    )
+    tx = VersionedTransaction(msg, [CENTRAL_KP])
+    resp = sol.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
     return resp.value
-
+    
 def kb_payout_done():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
