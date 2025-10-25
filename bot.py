@@ -23,7 +23,9 @@ from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
-
+from solders.hash import Hash
+from solders.message import Message
+from solders.transaction import Transaction as SoldersTx
 # ---------------------------
 # Configuration (ENV)
 # ---------------------------
@@ -647,18 +649,30 @@ def dex_market_buy_live(output_mint: str, amount_lamports: int, slippage_bps: in
 # Solana Send SOL (Withdraw)
 # ---------------------------
 from solders.system_program import TransferParams, transfer
-from solana.transaction import Transaction as LegacyTx  # nur zum Senden von native SOL
+
 def send_sol(to_address: str, lamports: int) -> str:
     """
-    Sendet native SOL von CENTRAL_KP an to_address.
+    Sendet native SOL von CENTRAL_KP an to_address (Legacy-Message + solders Transaction).
     """
     try:
-        to = Pubkey.from_string(to_address)
-        ix = transfer(TransferParams(from_pubkey=CENTRAL_KP.pubkey(), to_pubkey=to, lamports=lamports))
-        tx = LegacyTx().add(ix)
-        resp = SOL_CLIENT.send_transaction(tx, CENTRAL_KP, opts=TxOpts(skip_preflight=True, max_retries=3))
-        sig_str = str(resp.value) if hasattr(resp, "value") else str(resp)
-        return sig_str
+        # 1) Aktuellen Blockhash holen
+        latest = SOL_CLIENT.get_latest_blockhash()
+        bh: Hash = latest.value.blockhash
+
+        # 2) Transfer-Instruction bauen
+        to_pk = Pubkey.from_string(to_address)
+        ix = transfer(TransferParams(from_pubkey=CENTRAL_KP.pubkey(), to_pubkey=to_pk, lamports=lamports))
+
+        # 3) Legacy-Message mit Blockhash
+        msg = Message.new_with_blockhash([ix], CENTRAL_KP.pubkey(), bh)
+
+        # 4) Transaktion erzeugen & signieren (solders)
+        tx = SoldersTx.new_unsigned(msg)
+        tx.sign([CENTRAL_KP], bh)
+
+        # 5) Senden
+        resp = SOL_CLIENT.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=True, max_retries=3))
+        return str(getattr(resp, "value", resp))
     except Exception as e:
         raise RuntimeError(f"send_sol error: {e}")
 
