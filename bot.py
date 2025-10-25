@@ -1,50 +1,52 @@
 # bot.py
-# UTF-8  — Whales Alpha Memecoin Bot (MEME-only)
+# UTF-8 — Whales Alpha Memecoin Bot (MEME-only) — LIVE TRADING + LIVE WITHDRAW
+
 import os
 import time
 import random
 import threading
 import sqlite3
+import json
 import base64
+from base64 import b64decode
 from contextlib import contextmanager
 from typing import Optional, Dict, List, Tuple
 
 import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
+from telebot.apihelper import ApiTelegramException
 
-# ---- Solana/Jupiter (LIVE) ----
-from solana.rpc.api import Client as SolClient
+# ===== Solana / solders (solana>=0.36, solders>=0.26) =====
+from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
-from solana.rpc.commitment import Confirmed
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
-from solders.message import MessageV0
-from solders.system_program import transfer, TransferParams
 
 # ---------------------------
 # Configuration (ENV)
 # ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8410607683:AAGEErNQv0EUTA6H5INeHXtaCrt_KnG3KI8").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8271980014:AAGCQQEgAgJhtJ6z7XbrGCM4uNa08dmrapM").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable required")
 
 ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") if a.strip()]
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
-CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "CAYNcLuq8Jybk8GV1e7nCKGK6msAw8ktKSaXDqqBc3f4").strip()
-CENTRAL_SOL_SECRET = os.getenv("CENTRAL_SOL_SECRET", "4Wqy1bdxNqvVfdxcoiiXNLQwYLbg4zuPaKYPzR5V5CAf3HxcaCbTbcWxrBi93nKK1Um69YGJZp5o26zPwqFKVq5Q").strip()  # Base58 Private Key
-JUPITER_BASE = os.getenv("JUPITER_BASE", "https://quote-api.jup.ag").rstrip("/")
 
-if not CENTRAL_SOL_SECRET:
-    raise RuntimeError("CENTRAL_SOL_SECRET (Base58 Private Key) is required")
+# *** Zentrale Wallet (MUSS zusammenpassen!) ***
+CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "CAYNcLuq8Jybk8GV1e7nCKGK6msAw8ktKSaXDqqBc3f4").strip()
+CENTRAL_SOL_SECRET = os.getenv("CENTRAL_SOL_SECRET", "4Wqy1bdxNqvVfdxcoiiXNLQwYLbg4zuPaKYPzR5V5CAf3HxcaCbTbcWxrBi93nKK1Um69YGJZp5o26zPwqFKVq5Q").strip()
+
+# Jupiter API
+JUP_QUOTE = "https://quote-api.jup.ag/v6/quote"
+JUP_SWAP = "https://quote-api.jup.ag/v6/swap"
 
 # Liste bekannter Exchange-Absender (optional, CSV in ENV)
 EXCHANGE_WALLETS = set([s.strip() for s in os.getenv("EXCHANGE_WALLETS", "").split(",") if s.strip()])
 
 # Withdraw fee tiers (lockup_days: fee_percent)
-# 0 Tage = Sofort (20%), 5 Tage = 15%, 7 Tage = 10%, 10 Tage = 5%
-DEFAULT_FEE_Tiers = {0: 20.0, 5: 15.0, 7: 10.0, 10: 5.0}
+DEFAULT_FEE_TIERS = {0: 20.0, 5: 15.0, 7: 10.0, 10: 5.0}
 _fee_tiers: Dict[int, float] = {}
 raw_tiers = os.getenv("WITHDRAW_FEE_TIERS", "")
 if raw_tiers:
@@ -53,16 +55,38 @@ if raw_tiers:
             d, p = part.split(":")
             _fee_tiers[int(d)] = float(p)
     except Exception:
-        _fee_tiers = DEFAULT_FEE_Tiers.copy()
+        _fee_tiers = DEFAULT_FEE_TIERS.copy()
 else:
-    _fee_tiers = DEFAULT_FEE_Tiers.copy()
+    _fee_tiers = DEFAULT_FEE_TIERS.copy()
 
 DB_PATH = os.getenv("DB_PATH", "memebot_full.db")
 LAMPORTS_PER_SOL = 1_000_000_000
 MIN_SUB_SOL = float(os.getenv("MIN_SUB_SOL", "0.1"))
 
-# Simulation flag – jetzt egal: wir handeln live
+# Live-Trading AN
 SIMULATION_MODE = False
+
+# Solana Client + zentrale Keypair
+SOL_CLIENT = Client(SOLANA_RPC)
+
+def _kp_from_base58(secret_b58: str) -> Keypair:
+    try:
+        return Keypair.from_base58_string(secret_b58)
+    except Exception:
+        # Falls jemand Array-JSON in ENV hat: [..]
+        try:
+            arr = json.loads(secret_b58)
+            if isinstance(arr, list):
+                b = bytes(arr)
+                return Keypair.from_bytes(b)
+        except Exception:
+            pass
+        raise RuntimeError("CENTRAL_SOL_SECRET ist kein gültiger Base58-PrivateKey (oder JSON-Array).")
+
+CENTRAL_KP = _kp_from_base58(CENTRAL_SOL_SECRET)
+CENTRAL_PK = str(CENTRAL_KP.pubkey())
+if CENTRAL_PK != CENTRAL_SOL_PUBKEY:
+    print(f"[WARN] CENTRAL_SOL_PUBKEY != Key aus SECRET — ENV PUB={CENTRAL_SOL_PUBKEY} / SECRET PUK={CENTRAL_PK}")
 
 # ---------------------------
 # Utilities: price + formatting
@@ -150,8 +174,7 @@ CREATE TABLE IF NOT EXISTS payouts (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   last_notified_at TIMESTAMP,
   lockup_days INTEGER DEFAULT 0,
-  fee_percent REAL DEFAULT 0.0,
-  tx_sig TEXT
+  fee_percent REAL DEFAULT 0.0
 );
 CREATE TABLE IF NOT EXISTS news (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,13 +207,10 @@ def init_db():
             "ALTER TABLE payouts ADD COLUMN fee_percent REAL DEFAULT 0.0",
             "ALTER TABLE users ADD COLUMN referral_code TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN referral_bonus_claimed INTEGER DEFAULT 0",
-            "ALTER TABLE users ADD COLUMN payout_wallet TEXT",
-            "ALTER TABLE payouts ADD COLUMN tx_sig TEXT"
+            "ALTER TABLE users ADD COLUMN payout_wallet TEXT"
         ]:
-            try: 
-                con.execute(stmt)
-            except Exception: 
-                pass
+            try: con.execute(stmt)
+            except Exception: pass
 
 # ---------------------------
 # Misc helpers
@@ -449,99 +469,22 @@ def kb_payout_manage(pid: int):
     return kb
 
 # ---------------------------
-# Solana client & central wallet
-# ---------------------------
-sol = SolClient(SOLANA_RPC, commitment=Confirmed)
-CENTRAL_KP = Keypair.from_base58_string(CENTRAL_SOL_SECRET)
-CENTRAL_PUB = CENTRAL_KP.pubkey()
-
-# Jupiter helpers
-WSOL_MINT = "So11111111111111111111111111111111111111112"
-
-def jup_quote(input_mint: str, output_mint: str, amount_in_lamports: int) -> dict:
-    url = f"{JUPITER_BASE}/v6/quote"
-    params = {
-        "inputMint": input_mint,
-        "outputMint": output_mint,
-        "amount": amount_in_lamports,
-        "slippageBps": 150,  # 1.5%
-        "platformFeeBps": 0
-    }
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-def jup_swap(quote_response: dict, user_pubkey: str) -> str:
-    url = f"{JUPITER_BASE}/v6/swap"
-    payload = {
-        "quoteResponse": quote_response,
-        "userPublicKey": user_pubkey,
-        "wrapAndUnwrapSol": True,
-        "dynamicComputeUnitLimit": True,
-        "prioritizationFeeLamports": "auto",
-    }
-    r = requests.post(url, json=payload, timeout=25)
-    r.raise_for_status()
-    swap_tx_b64 = r.json()["swapTransaction"]
-    raw = base64.b64decode(swap_tx_b64)
-    tx = VersionedTransaction.deserialize(raw)
-    # Signieren mit zentralem Key
-    tx = VersionedTransaction(tx.message, [CENTRAL_KP])
-    sig = sol.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
-    return sig.value
-
-def dex_market_buy_live(token_mint: str, amount_lamports: int) -> Tuple[str, str]:
-    try:
-        q = jup_quote(WSOL_MINT, token_mint, amount_lamports)
-        routes = q.get("data") or []
-        if not routes:
-            return ("ERROR_NO_ROUTE", "")
-        best = routes[0]
-        sig = jup_swap(best, str(CENTRAL_PUB))
-        return ("FILLED", sig)
-    except Exception as e:
-        print("dex_market_buy_live error:", e)
-        return ("ERROR", "")
-
-def send_sol(to_pubkey: str, lamports: int) -> str:
-    to = Pubkey.from_string(to_pubkey)
-    ix = transfer(TransferParams(from_pubkey=CENTRAL_PUB, to_pubkey=to, lamports=lamports))
-    bh = sol.get_latest_blockhash().value.blockhash
-    msg = MessageV0.try_compile(
-        payer=CENTRAL_PUB,
-        instructions=[ix],
-        address_lookup_tables=[],
-        recent_blockhash=bh,
-    )
-    tx = VersionedTransaction(msg, [CENTRAL_KP])
-    resp = sol.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"))
-    return resp.value
-
-# ---------------------------
 # RPC watcher (backoff) — Einzahlungen
 # ---------------------------
 checked_signatures = set()
 
-def rpc(method: str, params: list, *, _retries=2, _base_sleep=0.8):
-    for attempt in range(_retries + 1):
-        try:
-            r = requests.post(SOLANA_RPC, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=10)
-            if r.status_code == 429:
-                sleep_s = _base_sleep * (2 ** attempt) + random.uniform(0, 0.4)
-                time.sleep(sleep_s); continue
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException as e:
-            if attempt < _retries:
-                sleep_s = _base_sleep * (2 ** attempt) + random.uniform(0, 0.4)
-                time.sleep(sleep_s); continue
-            print("RPC error:", e)
-            return {"result": None}
-    return {"result": None}
+def rpc_raw(method: str, params: list):
+    try:
+        r = requests.post(SOLANA_RPC, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("RPC error:", e)
+        return {"result": None}
 
 def get_new_signatures_for_address(address: str, limit: int = 20) -> List[str]:
     try:
-        res = rpc("getSignaturesForAddress", [address, {"limit": limit}])
+        res = rpc_raw("getSignaturesForAddress", [address, {"limit": limit}])
         arr = res.get("result") or []
         sigs = []
         for item in arr:
@@ -556,7 +499,7 @@ def get_new_signatures_for_address(address: str, limit: int = 20) -> List[str]:
 
 def get_tx_details(sig: str, central_addr: str):
     try:
-        r = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+        r = rpc_raw("getTransaction", [sig, {"encoding": "jsonParsed", "commitment": "confirmed"}])
         res = r.get('result')
         if not res: return None
         if (res.get('meta') or {}).get('err'): return None
@@ -576,14 +519,6 @@ def get_tx_details(sig: str, central_addr: str):
         for i, (p, po) in enumerate(zip(pre, post)):
             if p - po >= delta_central - 1000:
                 sender = keys[i]; break
-        if not sender:
-            for inst in (txmsg.get('instructions') or []):
-                if isinstance(inst, dict):
-                    info = (inst.get('parsed') or {}).get('info') or {}
-                    if info.get('destination') == central_addr and info.get('source'):
-                        sender = info['source']; break
-                    if info.get('to') == central_addr and info.get('from'):
-                        sender = info['from']; break
         return {"from": sender, "amount_lamports": int(delta_central), "blockTime": res.get("blockTime") or 0}
     except Exception as e:
         print("get_tx_details error:", e)
@@ -651,10 +586,81 @@ class CentralWatcher:
                 self.on_verified_deposit({"user_id": uid, "amount_lamports": amount, "sig": sig})
 
 # ---------------------------
-# Simulated trading (legacy) — wird nicht mehr genutzt
+# Jupiter — LIVE BUY
 # ---------------------------
-def dex_market_buy_simulated(user_id: int, base: str, amount_lamports: int):
-    return {"status": "FILLED", "txid": f"SIM-DEX-{base}-{int(time.time())}", "spent_lamports": amount_lamports}
+SO_MINT = "So11111111111111111111111111111111111111112"  # SOL (wrapped)
+
+def _http_get(url, params=None, timeout=12):
+    return requests.get(url, params=params, timeout=timeout)
+
+def _http_post_json(url, body: dict, timeout=20):
+    headers = {"Content-Type": "application/json"}
+    return requests.post(url, data=json.dumps(body), headers=headers, timeout=timeout)
+
+def dex_market_buy_live(output_mint: str, amount_lamports: int, slippage_bps: int = 150) -> dict:
+    """
+    Kauft output_mint gegen SOL mit Jupiter v6. amount_lamports = SOL in Lamports.
+    """
+    try:
+        # 1) QUOTE
+        q = _http_get(JUP_QUOTE, params={
+            "inputMint": SO_MINT,
+            "outputMint": output_mint,
+            "amount": str(amount_lamports),
+            "slippageBps": str(slippage_bps),
+            "platformFeeBps": "0",
+            "onlyDirectRoutes": "true"
+        }, timeout=15)
+        q.raise_for_status()
+        quote = q.json()
+        if "outAmount" not in quote:
+            raise RuntimeError(f"Quote-Fehler: {quote}")
+
+        # 2) SWAP (signable tx holen)
+        swap_req = {
+            "quoteResponse": quote,
+            "userPublicKey": CENTRAL_PK,
+            "wrapAndUnwrapSol": True,
+            "useSharedAccounts": True,
+            "asLegacyTransaction": False
+        }
+        s = _http_post_json(JUP_SWAP, swap_req, timeout=25)
+        s.raise_for_status()
+        swap = s.json()
+        swap_tx_b64 = swap.get("swapTransaction")
+        if not swap_tx_b64:
+            raise RuntimeError(f"Swap-Fehler: {swap}")
+
+        # 3) Signieren + Senden
+        raw = b64decode(swap_tx_b64)
+        tx = VersionedTransaction.from_bytes(raw)
+        tx.sign([CENTRAL_KP])
+        raw2 = bytes(tx)
+        sig = SOL_CLIENT.send_raw_transaction(raw2, opts=TxOpts(skip_preflight=True, max_retries=3))
+        sig_str = str(sig.value) if hasattr(sig, "value") else str(sig)
+        return {"status": "FILLED", "txid": sig_str, "spent_lamports": amount_lamports}
+    except Exception as e:
+        print("dex_market_buy_live error:", e)
+        return {"status": "ERROR", "error": str(e)}
+
+# ---------------------------
+# Solana Send SOL (Withdraw)
+# ---------------------------
+from solders.system_program import TransferParams, transfer
+from solana.transaction import Transaction as LegacyTx  # nur zum Senden von native SOL
+def send_sol(to_address: str, lamports: int) -> str:
+    """
+    Sendet native SOL von CENTRAL_KP an to_address.
+    """
+    try:
+        to = Pubkey.from_string(to_address)
+        ix = transfer(TransferParams(from_pubkey=CENTRAL_KP.pubkey(), to_pubkey=to, lamports=lamports))
+        tx = LegacyTx().add(ix)
+        resp = SOL_CLIENT.send_transaction(tx, CENTRAL_KP, opts=TxOpts(skip_preflight=True, max_retries=3))
+        sig_str = str(resp.value) if hasattr(resp, "value") else str(resp)
+        return sig_str
+    except Exception as e:
+        raise RuntimeError(f"send_sol error: {e}")
 
 # ---------------------------
 # Bot init & safe send wrappers
@@ -666,18 +672,28 @@ _original_send_message = bot.send_message
 def _safe_send_message(chat_id, text, **kwargs):
     try:
         return _original_send_message(chat_id, text, **kwargs)
-    except Exception:
-        pm = kwargs.get("parse_mode")
-        if pm and str(pm).upper().startswith("MARKDOWN"):
-            kwargs2 = dict(kwargs); kwargs2["parse_mode"] = "Markdown"
+    except ApiTelegramException as e:
+        # Falls Markdown kaputt ist: retry ohne parse_mode
+        if "can't parse entities" in str(e).lower():
+            kwargs2 = dict(kwargs); kwargs2.pop("parse_mode", None)
             try:
-                return _original_send_message(chat_id, md_escape(str(text)), **kwargs2)
+                return _original_send_message(chat_id, str(text), **kwargs2)
             except Exception:
-                kwargs3 = dict(kwargs2); kwargs2.pop("parse_mode", None)
-                return _original_send_message(chat_id, str(text), **kwargs3)
-        else:
-            kwargs3 = dict(kwargs); kwargs3.pop("parse_mode", None)
+                pass
+    except Exception:
+        pass
+    # Fallback: escapen oder ohne parse_mode
+    pm = kwargs.get("parse_mode")
+    if pm and str(pm).upper().startswith("MARKDOWN"):
+        kwargs2 = dict(kwargs); kwargs2["parse_mode"] = "Markdown"
+        try:
+            return _original_send_message(chat_id, md_escape(str(text)), **kwargs2)
+        except Exception:
+            kwargs3 = dict(kwargs2); kwargs3.pop("parse_mode", None)
             return _original_send_message(chat_id, str(text), **kwargs3)
+    else:
+        kwargs3 = dict(kwargs); kwargs3.pop("parse_mode", None)
+        return _original_send_message(chat_id, str(text), **kwargs3)
 
 bot.send_message = _safe_send_message
 
@@ -685,18 +701,26 @@ _original_edit_message_text = bot.edit_message_text
 def _safe_edit_message_text(text, chat_id, message_id, **kwargs):
     try:
         return _original_edit_message_text(text, chat_id, message_id, **kwargs)
-    except Exception:
-        pm = kwargs.get("parse_mode")
-        if pm and str(pm).upper().startswith("MARKDOWN"):
-            kwargs2 = dict(kwargs); kwargs2["parse_mode"] = "Markdown"
+    except ApiTelegramException as e:
+        if "can't parse entities" in str(e).lower():
+            kwargs2 = dict(kwargs); kwargs2.pop("parse_mode", None)
             try:
-                return _original_edit_message_text(md_escape(str(text)), chat_id, message_id, **kwargs2)
+                return _original_edit_message_text(str(text), chat_id, message_id, **kwargs2)
             except Exception:
-                kwargs3 = dict(kwargs2); kwargs2.pop("parse_mode", None)
-                return _original_edit_message_text(str(text), chat_id, message_id, **kwargs3)
-        else:
-            kwargs3 = dict(kwargs); kwargs3.pop("parse_mode", None)
+                pass
+    except Exception:
+        pass
+    pm = kwargs.get("parse_mode")
+    if pm and str(pm).upper().startswith("MARKDOWN"):
+        kwargs2 = dict(kwargs); kwargs2["parse_mode"] = "Markdown"
+        try:
+            return _original_edit_message_text(md_escape(str(text)), chat_id, message_id, **kwargs2)
+        except Exception:
+            kwargs3 = dict(kwargs2); kwargs3.pop("parse_mode", None)
             return _original_edit_message_text(str(text), chat_id, message_id, **kwargs3)
+    else:
+        kwargs3 = dict(kwargs); kwargs3.pop("parse_mode", None)
+        return _original_edit_message_text(str(text), chat_id, message_id, **kwargs3)
 
 bot.edit_message_text = _safe_edit_message_text
 
@@ -732,12 +756,9 @@ def ensure_db_backup():
     try:
         if os.path.exists(DB_PATH):
             bak = DB_PATH + ".bak." + time.strftime("%Y%m%d%H%M%S")
-            try:
-                with open(DB_PATH, "rb") as fin, open(bak, "wb") as fout:
-                    fout.write(fin.read())
-                print(f"DB backup created: {bak}")
-            except Exception as e:
-                print("Backup failed:", e)
+            with open(DB_PATH, "rb") as fin, open(bak, "wb") as fout:
+                fout.write(fin.read())
+            print(f"DB backup created: {bak}")
         else:
             print("DB does not exist yet; will be created on init.")
     except Exception as e:
@@ -769,11 +790,11 @@ def home_text(u) -> str:
         f"{BRAND}\n\n"
         f"👋 Hallo {uname} — willkommen!\n\n"
         "Was du hier bekommst:\n"
-        "• Einzahlungen & automatisches Gutschreiben (verifizierte Source-Wallet)  \n"
-        "• 🔔 Alpha Meme-Signale & Auto-Entry (LOW/MEDIUM/HIGH)  \n"
-        "• Flexible Auszahlungen mit Lockup und Gebühren  \n"
+        "• Einzahlungen & automatisches Gutschreiben (verifizierte Source-Wallet)\n"
+        "• 🔔 Alpha Meme-Signale & Auto-Entry (LOW/MEDIUM/HIGH)\n"
+        "• Flexible Auszahlungen mit Lockup und Gebühren\n"
         f"• Referral: {ref_link_md}\n\n"
-        f"🏦 Aktuelles Guthaben: *{bal}*  \n"
+        f"🏦 Aktuelles Guthaben: *{bal}*\n"
         "📩 Support: /support\n"
     )
 
@@ -792,7 +813,7 @@ def cmd_start(m: Message):
     admin_flag = 1 if is_admin(uid) else 0
     upsert_user(uid, uname, admin_flag)
 
-    # Referral payload (/start CODE oder /start=CODE)
+    # Referral payload
     ref_code = None
     txt = (m.text or "")
     parts = txt.split()
@@ -815,7 +836,7 @@ def cmd_start(m: Message):
                 ref_row = con.execute("SELECT user_id FROM users WHERE referral_code=?", (ref_code,)).fetchone()
             referrer = row_get(ref_row, "user_id")
             if referrer and referrer != uid:
-                bonus_lam = int(0.01 * LAMPORTS_PER_SOL)  # 0.01 SOL Bonus
+                bonus_lam = int(0.01 * LAMPORTS_PER_SOL)
                 add_balance(referrer, bonus_lam)
                 add_balance(uid, bonus_lam)
                 mark_referral_claimed(uid)
@@ -843,51 +864,46 @@ def on_cb(c: CallbackQuery):
     if data == "help":
         bot.answer_callback_query(c.id)
         bot.send_message(uid,
-                         ("ℹ️ Hilfe:\n\n"
-                          "1) Einzahlen: Absender-Wallet setzen → SOL an zentrale Adresse.\n"
-                          "2) Meme-News: Abo ein/aus.\n"
-                          "3) Auto-Entry: ON/OFF + Risiko.\n"
-                          "4) Auszahlung: Betrag eingeben → Lockup/Fees wählen.\n"
-                          "5) /support: Nachricht an Admins."),
+                         md_escape("ℹ️ Hilfe:\n\n1) Einzahlen: Absender-Wallet setzen → SOL an zentrale Adresse.\n2) Meme-News: Abo ein/aus.\n3) Auto-Entry: ON/OFF + Risiko.\n4) Auszahlung: Betrag eingeben → Lockup/Fees wählen.\n5) /support: Nachricht an Admins."),
                          parse_mode="Markdown")
         return
 
-    # deposit – Adresse hier setzen/ändern
+    # deposit
     if data == "deposit":
         if not row_get(u, "source_wallet"):
             WAITING_SOURCE_WALLET[uid] = True
             bot.answer_callback_query(c.id, "Bitte zuerst deine Absender-Wallet senden.")
-            bot.send_message(uid, "🔑 Sende jetzt deine **Absender-Wallet (SOL)**:")
+            bot.send_message(uid, "🔑 Sende jetzt deine Absender-Wallet (SOL):")
             return
         price = get_sol_usd()
         px = f"(1 SOL ≈ {price:.2f} USDC)" if price > 0 else ""
         bot.edit_message_text(
             f"Absender-Wallet: `{md_escape(row_get(u,'source_wallet','-'))}`\n"
             f"Sende SOL an: `{md_escape(CENTRAL_SOL_PUBKEY)}`\n{px}\n\n"
-            "🔄 Möchtest du die Absender-Wallet ändern? Schicke einfach **eine neue Solana-Adresse** als Nachricht.",
+            "🔄 Möchtest du die Absender-Wallet ändern? Schicke einfach eine neue Solana-Adresse als Nachricht.",
             c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u)
         )
         WAITING_SOURCE_WALLET[uid] = True
         return
 
-    # withdraw – zuerst Auszahlungsadresse (falls fehlt/ändern)
+    # withdraw
     if data == "withdraw":
         if not row_get(u, "payout_wallet"):
             WAITING_PAYOUT_WALLET[uid] = True
             bot.answer_callback_query(c.id, "Bitte zuerst deine Auszahlungsadresse senden.")
-            bot.send_message(uid, "🔑 Sende jetzt deine **Auszahlungsadresse (SOL)**:")
+            bot.send_message(uid, "🔑 Sende jetzt deine Auszahlungsadresse (SOL):")
             return
         WAITING_WITHDRAW_AMOUNT[uid] = None
         bot.answer_callback_query(c.id, "Bitte Betrag eingeben.")
         bot.send_message(uid,
                          f"💳 Auszahlungsadresse: `{md_escape(row_get(u,'payout_wallet','-'))}`\n"
-                         "🔄 Zum Ändern sende einfach **eine neue Solana-Adresse**.\n\n"
-                         "Gib nun den Betrag in SOL ein (z. B. `0.25`):",
+                         "🔄 Zum Ändern sende einfach eine neue Solana-Adresse.\n\n"
+                         "Gib nun den Betrag in SOL ein (z. B. 0.25):",
                          parse_mode="Markdown")
         WAITING_PAYOUT_WALLET[uid] = True
         return
 
-    # subscriptions (Meme only)
+    # subscriptions
     if data == "sub_menu":
         bot.edit_message_text("Meme-News:", c.message.chat.id, c.message.message_id, reply_markup=kb_sub_menu())
         return
@@ -964,7 +980,7 @@ def on_cb(c: CallbackQuery):
     if data == "admin_new_call":
         if not is_admin(uid): return
         bot.answer_callback_query(c.id)
-        bot.send_message(uid, "Sende den MEME-Call im Format:\nMEME|NAME_ODER_SYMBOL|TOKEN_ADDRESS (oder `-`)\nOptional: Zeile danach Notes", parse_mode=None)
+        bot.send_message(uid, md_escape("Sende den MEME-Call im Format:\nMEME|NAME_ODER_SYMBOL|TOKEN_ADDRESS (oder -)\nOptional: Zeile danach Notes"), parse_mode="Markdown")
         ADMIN_AWAIT_SIMPLE_CALL[uid] = True
         return
 
@@ -1045,7 +1061,7 @@ def on_cb(c: CallbackQuery):
             return
         ADMIN_AWAIT_BALANCE_EDIT[uid] = target
         bot.answer_callback_query(c.id, f"Guthabenänderung: UID {target}")
-        bot.send_message(uid, "Sende **Betrag in SOL** (z. B. `0.20`) **oder Prozent** (z. B. `-40%`).")
+        bot.send_message(uid, "Sende Betrag in SOL (z. B. 0.20) oder Prozent (z. B. -40%).")
         return
 
     if data.startswith("admin_setwallet_"):
@@ -1056,8 +1072,8 @@ def on_cb(c: CallbackQuery):
             bot.answer_callback_query(c.id, "Ungültig")
             return
         ADMIN_AWAIT_SET_WALLET[uid] = target
-        bot.answer_callback_query(c.id, f"Sende `SRC <adresse>` oder `PAY <adresse>` für UID {target}")
-        bot.send_message(uid, "Beispiele:\n`SRC 9abc...`  (Source/Einzahlung)\n`PAY 8xyz...`  (Payout/Auszahlung)", parse_mode="Markdown")
+        bot.answer_callback_query(c.id, f"Sende 'SRC <adresse>' oder 'PAY <adresse>' für UID {target}")
+        bot.send_message(uid, "Beispiele:\nSRC 9abc...  (Source/Einzahlung)\nPAY 8xyz...  (Payout/Auszahlung)", parse_mode=None)
         return
 
     if data.startswith("admin_payouts_"):
@@ -1081,7 +1097,7 @@ def on_cb(c: CallbackQuery):
         if not is_admin(uid): return
         ADMIN_AWAIT_NEWS_BROADCAST[uid] = {"step": "await_text_to_all"}
         bot.answer_callback_query(c.id)
-        bot.send_message(uid, "Sende die **Nachricht**, die an **alle Nutzer** (alle, die /start gedrückt haben) gesendet werden soll.")
+        bot.send_message(uid, "Sende die Nachricht, die an alle Nutzer gesendet werden soll.")
         return
 
     if data == "admin_apply_pnl":
@@ -1089,10 +1105,10 @@ def on_cb(c: CallbackQuery):
             bot.answer_callback_query(c.id, "Nicht erlaubt.")
             return
         ADMIN_AWAIT_MASS_BALANCE[uid] = True
-        bot.answer_callback_query(c.id, "Sende z. B.:\n• `ALL -40%`\n• `PROMO PERCENT 20 ALL`\n• `PROMO BONUS 0.05 SUBSCRIBERS`\n• `PNL <CALL_ID> 20`")
+        bot.answer_callback_query(c.id, "Sende z. B.:\n• ALL -40%\n• PROMO PERCENT 20 ALL\n• PROMO BONUS 0.05 SUBSCRIBERS\n• PNL <CALL_ID> 20")
         return
 
-    # payout option chosen (User) — bleibt REQUESTED, Admin sendet später on-chain
+    # payout option chosen
     if data.startswith("payoutopt_"):
         try:
             days = int(data.split("_", 1)[1])
@@ -1151,7 +1167,7 @@ def on_cb(c: CallbackQuery):
                 pass
         return
 
-    # admin payout manage actions — hier wird wirklich gesendet
+    # admin payout manage actions
     if data.startswith("payout_"):
         if not is_admin(uid):
             bot.answer_callback_query(c.id, "Nicht erlaubt.")
@@ -1192,23 +1208,24 @@ def on_cb(c: CallbackQuery):
             return
 
         if action == "SENT":
-            # Wirklich on-chain senden, tx_sig speichern
+            # ECHTE Auszahlung ausführen
             try:
-                uuser = get_user(tgt_uid)
-                payout_wallet = row_get(uuser, "payout_wallet", "")
-                if not payout_wallet:
-                    bot.answer_callback_query(c.id, "Keine Payout-Adresse beim Nutzer."); return
-                txsig = send_sol(payout_wallet, net_lam)
+                u2 = get_user(tgt_uid)
+                payout_addr = row_get(u2, "payout_wallet", "")
+                if not payout_addr or not is_probably_solana_address(payout_addr):
+                    bot.answer_callback_query(c.id, "Keine gültige Auszahlungsadresse.")
+                    return
+                sig = send_sol(payout_addr, net_lam)  # nur NETTO auszahlen
                 with get_db() as con:
-                    con.execute("UPDATE payouts SET status='SENT', tx_sig=? WHERE id=?", (txsig, pid))
+                    con.execute("UPDATE payouts SET status='SENT', note=? WHERE id=?", (f"tx: {sig}", pid))
                 bot.answer_callback_query(c.id, "Als gesendet markiert.")
                 try:
                     bot.send_message(
                         tgt_uid,
                         (f"📤 Deine Auszahlung #{pid} wurde *gesendet*.\n"
-                         f"Betrag: {fmt_sol_usdc(amt)}\nGebühr: {fee_percent:.2f}% ({fmt_sol_usdc(fee_lam)})\n"
+                         f"Brutto: {fmt_sol_usdc(amt)}\nGebühr: {fee_percent:.2f}% ({fmt_sol_usdc(fee_lam)})\n"
                          f"Netto: {fmt_sol_usdc(net_lam)}\n"
-                         f"Tx: `{md_escape(txsig)}`"),
+                         f"`{md_escape(sig)}`"),
                         parse_mode="Markdown"
                     )
                 except Exception:
@@ -1220,7 +1237,7 @@ def on_cb(c: CallbackQuery):
         if action == "REJECT":
             with get_db() as con:
                 con.execute("UPDATE payouts SET status='REJECTED' WHERE id=?", (pid,))
-            add_balance(tgt_uid, amt)  # reservierten Betrag zurückerstatten
+            add_balance(tgt_uid, amt)  # reservierten Betrag zurück
             bot.answer_callback_query(c.id, "Abgelehnt und Betrag erstattet.")
             try: bot.send_message(tgt_uid, f"❌ Deine Auszahlung #{pid} wurde *abgelehnt*. Betrag wurde zurückerstattet.", parse_mode="Markdown")
             except Exception: pass
@@ -1254,7 +1271,7 @@ def catch_all(m: Message):
             bot.reply_to(m, "Nicht erlaubt."); return
         parts = text.split(None, 1)
         if len(parts) != 2:
-            bot.reply_to(m, "Format: `SRC <adresse>` oder `PAY <adresse>`", parse_mode="Markdown"); return
+            bot.reply_to(m, "Format: SRC <adresse> oder PAY <adresse>", parse_mode=None); return
         which, addr = parts[0].upper(), parts[1].strip()
         if not is_probably_solana_address(addr):
             bot.reply_to(m, "Ungültige Solana-Adresse."); return
@@ -1265,7 +1282,7 @@ def catch_all(m: Message):
             set_payout_wallet(target, addr)
             bot.reply_to(m, f"✅ Payout-Wallet für UID {target} gesetzt: `{md_escape(addr)}`", parse_mode="Markdown")
         else:
-            bot.reply_to(m, "Nutze `SRC` oder `PAY`.", parse_mode="Markdown")
+            bot.reply_to(m, "Nutze SRC oder PAY.", parse_mode=None)
         return
 
     # User: Source/Payout Wallet Direkt-Eingabe
@@ -1296,7 +1313,7 @@ def catch_all(m: Message):
         notes = "\n".join(lines[1:]) if len(lines) > 1 else ""
         parts = [p.strip() for p in head.split("|")]
         if len(parts) < 2 or parts[0].upper() != "MEME":
-            bot.reply_to(m, "Format: MEME|NAME|TOKEN_ADDRESS (oder `-`)"); return
+            bot.reply_to(m, "Format: MEME|NAME|TOKEN_ADDRESS (oder -)"); return
         _, base, token_addr = (parts + ["-"])[:3]
         token_addr = None if token_addr == "-" else token_addr
         cid = create_call(uid, base.upper(), token_addr, notes)
@@ -1318,13 +1335,13 @@ def catch_all(m: Message):
                 set_balance(target, new)
                 bot.reply_to(m, f"✅ UID {target}: {fmt_sol_usdc(old)} → {fmt_sol_usdc(new)} ({pct:+.2f}%)")
             else:
-                sol_amt = float(text.replace(",", "."))
-                lam = int(sol_amt * LAMPORTS_PER_SOL)
+                sol = float(text.replace(",", "."))
+                lam = int(sol * LAMPORTS_PER_SOL)
                 set_balance(target, lam)
                 nb = fmt_sol_usdc(get_balance_lamports(target))
                 bot.reply_to(m, f"✅ Guthaben gesetzt: UID {target} {fmt_sol_usdc(lam)} • Neues Guthaben: {nb}")
         except Exception:
-            bot.reply_to(m, "Bitte Zahl (z. B. `0.25`) **oder** Prozent (z. B. `-40%`) senden.")
+            bot.reply_to(m, "Bitte Zahl (z. B. 0.25) oder Prozent (z. B. -40%) senden.")
         return
 
     # Admin: mass operations
@@ -1337,7 +1354,7 @@ def catch_all(m: Message):
             if cmd.upper().startswith("ALL"):
                 parts = cmd.split()
                 if len(parts) != 2 or not parts[1].endswith("%"):
-                    bot.reply_to(m, "Format: `ALL -40%` oder `ALL +25%`"); return
+                    bot.reply_to(m, "Format: ALL -40% oder ALL +25%"); return
                 pct = float(parts[1][:-1].replace(",", "."))
                 ids = all_users()
                 changed = 0
@@ -1395,7 +1412,7 @@ def catch_all(m: Message):
                 bot.reply_to(m, f"✅ PNL angewendet (Call {call_id}) auf {affected} Nutzer.")
                 return
 
-            bot.reply_to(m, "Unbekannter Befehl. Beispiele: `ALL -40%`, `PROMO PERCENT 20 ALL`, `PNL 12 15`")
+            bot.reply_to(m, "Unbekannter Befehl. Beispiele: ALL -40%, PROMO PERCENT 20 ALL, PNL 12 15")
         except Exception as e:
             bot.reply_to(m, f"Fehler: {e}")
         return
@@ -1428,17 +1445,17 @@ def catch_all(m: Message):
             bot.reply_to(m, f"✅ Auszahlungsadresse aktualisiert: `{md_escape(text)}`\nGib nun den Betrag in SOL ein (z. B. 0.25).", parse_mode="Markdown")
             return
         try:
-            sol_amt = float(text.replace(",", "."))
-            if sol_amt <= 0:
+            sol = float(text.replace(",", "."))
+            if sol <= 0:
                 bot.reply_to(m, "Betrag muss > 0 sein."); return
-            lam = int(sol_amt * LAMPORTS_PER_SOL)
+            lam = int(sol * LAMPORTS_PER_SOL)
             if get_balance_lamports(uid) < lam:
                 bot.reply_to(m, f"Unzureichendes Guthaben. Verfügbar: {fmt_sol_usdc(get_balance_lamports(uid))}")
                 WAITING_WITHDRAW_AMOUNT.pop(uid, None); return
             WAITING_WITHDRAW_AMOUNT[uid] = lam
             bot.reply_to(m, f"Auszahlung: {fmt_sol_usdc(lam)} — Wähle Lockup & Fee:", reply_markup=kb_withdraw_options())
         except Exception:
-            bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. `0.25`.")
+            bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. 0.25.")
         return
 
     # Default
@@ -1465,27 +1482,29 @@ def auto_executor_loop():
                     continue
                 call = get_call(row_get(r,"call_id"))
                 stake_info = row_get(r,"stake_lamports") or _compute_stake_for_user(row_get(r,"user_id"))
-                token_mint = row_get(call, "token_address", None)
-                if not token_mint:
+                token_addr = row_get(call, "token_address", None)
+                if not token_addr:
                     with get_db() as con:
-                        con.execute("UPDATE executions SET status='ERROR', message='No token' WHERE id=?", (row_get(r,"eid"),))
+                        con.execute("UPDATE executions SET status='ERROR', message='No token address' WHERE id=?", (row_get(r,"eid"),))
                     continue
-                # LIVE: Jupiter Swap
-                status, sig = dex_market_buy_live(token_mint, int(stake_info))
-                if status != "FILLED":
-                    with get_db() as con:
-                        con.execute("UPDATE executions SET status='ERROR', txid=?, message='Swap error' WHERE id=?", (sig, row_get(r,"eid")))
-                else:
-                    with get_db() as con:
-                        con.execute("UPDATE executions SET status='FILLED', txid=?, message='JOINED' WHERE id=?", (sig, row_get(r,"eid")))
+
+                # LIVE KAUF über Jupiter
+                result = dex_market_buy_live(token_addr, int(stake_info))
+                status = result.get("status") or "ERROR"
+                txid = result.get("txid") or result.get("order_id") or ""
+                msg = result.get("error", "JOINED")
+
+                with get_db() as con:
+                    con.execute("UPDATE executions SET status=?, txid=?, message=? WHERE id=?", (status, txid, msg, row_get(r,"eid")))
+
                 try:
                     bot.send_message(row_get(r,"user_id"),
                                      f"🤖 Auto-Entry • {row_get(r,'auto_risk','MEDIUM')}\n"
                                      f"{fmt_call(call)}\n"
                                      f"Status: *{status}*\n"
-                                     f"Einsatz (Info): {fmt_sol_usdc(stake_info)}\n"
+                                     f"Einsatz (SOL): {fmt_sol_usdc(stake_info)}\n"
                                      f"Guthaben: {fmt_sol_usdc(get_balance_lamports(row_get(r,'user_id')))}\n"
-                                     f"`{md_escape(sig)}`",
+                                     f"`{md_escape(txid or msg)}`",
                                      parse_mode="Markdown")
                 except Exception:
                     pass
@@ -1519,5 +1538,5 @@ def payout_reminder_loop():
 threading.Thread(target=auto_executor_loop, daemon=True).start()
 threading.Thread(target=payout_reminder_loop, daemon=True).start()
 
-print("Bot läuft — MEME-only. SIMULATION_MODE =", SIMULATION_MODE)
+print("Bot läuft — MEME-only. SIMULATION_MODE =", SIMULATION_MODE, "| Central PUK =", CENTRAL_PK)
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
