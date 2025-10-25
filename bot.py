@@ -26,7 +26,7 @@ from solders.system_program import transfer, TransferParams
 # ---------------------------
 # Configuration (ENV)
 # ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8271980014:AAGCQQEgAgJhtJ6z7XbrGCM4uNa08dmrapM").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8410607683:AAGEErNQv0EUTA6H5INeHXtaCrt_KnG3KI8").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable required")
 
