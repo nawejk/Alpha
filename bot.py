@@ -292,15 +292,17 @@ def check_solana_deposit(from_wallet: str, to_wallet: str, min_amount_sol: float
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     user = get_or_create_user(message)
+
     text = (
-        f"Willkommen, @{message.from_user.username or message.from_user.first_name}!\n\n"
+        "Willkommen! 👋\n\n"
         "Straight & easy: Deposit → Auto-Entry → Copy-Trades.\n\n"
         f"Dein Guthaben: *{user['balance_usd']:.2f} USD*"
     )
+
     bot.send_message(
         message.chat.id,
         text,
-        parse_mode="Markdown",
+        parse_mode="Markdown",  # bleibt okay, weil kein Username mit Unterstrich mehr drin ist
         reply_markup=main_menu_kb(user)
     )
 
