@@ -348,7 +348,7 @@ def kb_main(u):
            InlineKeyboardButton("💳 Auszahlung", callback_data="withdraw"))
     kb.add(InlineKeyboardButton("🔔 Signale", callback_data="sub_menu"),
            InlineKeyboardButton("⚖️ infos ", callback_data="legal"))
-    kb.add(InlineKeyboardButton("📜 Rückblick", callback_data="history"),
+    kb.add(InlineKeyboardButton("📜 Rückblick", callback_data="history")),
     kb.add(InlineKeyboardButton("📈 Wallet", callback_data="my_portfolio"))
     if is_admin(int(u["user_id"])):
         kb.add(InlineKeyboardButton("🛠️ Admin (Kontrolle)", callback_data="admin_menu_big"))
